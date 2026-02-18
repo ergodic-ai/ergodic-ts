@@ -8,10 +8,13 @@ dependencies = [
     "snowflake-connector-python[pandas]",
     "python-dotenv",
     "pydantic>=2.0",
+    "graphviz",
+    "numpyro>=0.15",
+    "jax>=0.4",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "matplotlib>=3.8",
 ]
-
-[project.optional-dependencies]
-viz = ["graphviz"]
 
 [build-system]
 requires = ["hatchling"]
@@ -24,6 +27,7 @@ packages = ["src/ergodicts"]
 dev = [
     "ipykernel>=7.2.0",
     "pytest>=8.0",
+    "httpx>=0.27",
 ]
 docs = [
     "mkdocs-material",

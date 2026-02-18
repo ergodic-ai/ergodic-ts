@@ -21,3 +21,5 @@ notebooks/
 
 # Docs build output
 site/
+runs/*
+runs

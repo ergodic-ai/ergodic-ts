@@ -1,0 +1,1510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ergodicts Backtest Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  :root { --bg: #fafafa; --sidebar-bg: #f0f0f0; --border: #ddd; --accent: #2563eb; --text: #1a1a1a; --muted: #666; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; }
+
+  /* Sidebar */
+  .sidebar { width: 280px; min-width: 280px; background: var(--sidebar-bg); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  .sidebar-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+  .sidebar-header h2 { font-size: 15px; }
+  .btn { padding: 6px 14px; border: 1px solid var(--border); border-radius: 4px; background: white; cursor: pointer; font-size: 13px; }
+  .btn:hover { background: #eee; }
+  .btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
+  .btn-primary:hover { background: #1d4ed8; }
+  .run-list { flex: 1; overflow-y: auto; padding: 8px; }
+  .run-item { padding: 10px 12px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; }
+  .run-item:hover { background: #e4e4e7; }
+  .run-item.active { background: #dbeafe; border: 1px solid var(--accent); }
+  .run-item .name { font-weight: 600; font-size: 13px; }
+  .run-item .meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+  .badge-running { background: #fef3c7; color: #92400e; }
+  .badge-completed { background: #d1fae5; color: #065f46; }
+  .badge-failed { background: #fecaca; color: #991b1b; }
+
+  /* Main */
+  .main { flex: 1; overflow-y: auto; padding: 24px; }
+  .placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); font-size: 15px; }
+  .detail-header { margin-bottom: 20px; }
+  .detail-header h1 { font-size: 22px; margin-bottom: 4px; }
+  .detail-header .info { font-size: 13px; color: var(--muted); }
+
+  /* Section headers */
+  .section-title { font-size: 14px; font-weight: 600; margin: 20px 0 8px 0; }
+
+  /* Metrics table */
+  .metrics-wrap { overflow-x: auto; margin-bottom: 24px; }
+  .metrics-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace; }
+  .metrics-table th, .metrics-table td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .metrics-table th { font-weight: 600; background: #f5f5f5; position: sticky; top: 0; z-index: 1; }
+  .metrics-table th:first-child, .metrics-table td:first-child { text-align: left; position: sticky; left: 0; background: white; z-index: 2; font-weight: 500; }
+  .metrics-table th:first-child { background: #f5f5f5; z-index: 3; }
+  .metrics-table tbody tr:hover { background: #f8fafc; }
+  .metrics-table tbody tr:hover td:first-child { background: #f8fafc; }
+  .metrics-table tr.row-aggregate { background: #eef2ff; font-weight: 600; }
+  .metrics-table tr.row-aggregate td:first-child { background: #eef2ff; }
+  .metrics-table tr.row-aggregate:hover { background: #e0e7ff; }
+  .metrics-table tr.row-aggregate:hover td:first-child { background: #e0e7ff; }
+  .metrics-table th[title] { cursor: help; border-bottom: 2px dashed #bbb; }
+
+  /* Config section */
+  .config-section { margin-bottom: 20px; }
+  .config-toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 14px; font-weight: 600; user-select: none; color: var(--accent); }
+  .config-toggle:hover { text-decoration: underline; }
+  .config-toggle .arrow { transition: transform 0.2s; display: inline-block; }
+  .config-toggle .arrow.open { transform: rotate(90deg); }
+  .config-body { display: none; margin-top: 12px; }
+  .config-body.open { display: block; }
+
+  .params-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .param-card { background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+  .param-card .label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 2px; }
+  .param-card .value { font-size: 15px; font-weight: 600; font-family: "SF Mono", "Fira Code", monospace; }
+
+  .sub-section-title { font-size: 13px; font-weight: 600; color: var(--muted); margin: 16px 0 8px 0; text-transform: uppercase; letter-spacing: 0.5px; }
+  .dag-placeholder { padding: 16px; background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); font-size: 13px; text-align: center; }
+
+  .node-configs-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 16px; }
+  .node-configs-table th, .node-configs-table td { padding: 5px 10px; border-bottom: 1px solid var(--border); text-align: left; }
+  .node-configs-table th { background: #f5f5f5; font-weight: 600; font-size: 11px; text-transform: uppercase; }
+
+  /* Charts */
+  .charts-section { margin-bottom: 24px; }
+  .chart-container { margin-bottom: 16px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+
+  /* Folds accordion */
+  .fold-header { padding: 10px 14px; background: var(--sidebar-bg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; margin-bottom: 4px; font-size: 13px; font-weight: 600; user-select: none; }
+  .fold-header:hover { background: #e4e4e7; }
+  .fold-body { padding: 12px 14px; border: 1px solid var(--border); border-top: 0; border-radius: 0 0 4px 4px; margin-top: -5px; margin-bottom: 8px; display: none; }
+  .fold-body.open { display: block; }
+
+  /* Modal */
+  .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); display: none; align-items: center; justify-content: center; z-index: 100; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: white; border-radius: 8px; padding: 24px; width: 480px; max-height: 90vh; overflow-y: auto; }
+  .modal h2 { margin-bottom: 16px; font-size: 18px; }
+  .form-group { margin-bottom: 12px; }
+  .form-group label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--muted); }
+  .form-group input, .form-group select { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; }
+  .form-row { display: flex; gap: 12px; }
+  .form-row .form-group { flex: 1; }
+  .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+  /* Progress */
+  .progress-bar { width: 100%; height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .progress-fill { height: 100%; background: var(--accent); transition: width 0.3s; }
+  .progress-text { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  /* Help modal */
+  .help-modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.45); display: none; align-items: flex-start; justify-content: center; z-index: 200; padding-top: 6vh; }
+  .help-modal-overlay.open { display: flex; }
+  .help-modal { background: white; border-radius: 10px; width: 560px; max-height: 82vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.2); }
+  .help-modal-header { padding: 18px 22px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  .help-modal-header h2 { font-size: 17px; margin: 0; }
+  .help-modal-close { background: none; border: none; font-size: 22px; cursor: pointer; color: var(--muted); padding: 0 4px; line-height: 1; }
+  .help-modal-close:hover { color: var(--text); }
+  .help-modal-body { overflow-y: auto; padding: 16px 22px 22px; }
+  .help-entry { margin-bottom: 18px; scroll-margin-top: 16px; }
+  .help-entry:last-child { margin-bottom: 0; }
+  .help-entry-name { font-size: 14px; font-weight: 700; font-family: "SF Mono", "Fira Code", monospace; color: var(--accent); margin-bottom: 3px; }
+  .help-entry-aka { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .help-entry-body { font-size: 13px; line-height: 1.55; color: #333; }
+  .help-entry-body code { background: #f1f5f9; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .help-entry-formula { font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; background: #f8fafc; border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; margin-top: 6px; display: inline-block; }
+  .help-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin: 22px 0 12px; }
+  .help-section-title:first-child { margin-top: 0; }
+  .help-entry-tags { display: flex; gap: 4px; margin-top: 4px; }
+  .help-tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+  .help-tag-lower { background: #dcfce7; color: #166534; }
+  .help-tag-higher { background: #dbeafe; color: #1e40af; }
+  .help-tag-pct { background: #fef3c7; color: #92400e; }
+  .help-tag-abs { background: #f1f5f9; color: #475569; }
+
+  /* Column picker */
+  .col-picker-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.3); display: none; align-items: flex-start; justify-content: center; z-index: 150; padding-top: 10vh; }
+  .col-picker-overlay.open { display: flex; }
+  .col-picker { background: white; border-radius: 8px; width: 340px; box-shadow: 0 12px 40px rgba(0,0,0,0.18); }
+  .col-picker-header { padding: 14px 18px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+  .col-picker-header h3 { font-size: 14px; margin: 0; }
+  .col-picker-header .actions { display: flex; gap: 8px; }
+  .col-picker-body { padding: 10px 18px 16px; }
+  .col-picker-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer; user-select: none; font-size: 13px; }
+  .col-picker-item:hover { color: var(--accent); }
+  .col-picker-item input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+  .col-picker-item .col-name { font-weight: 600; font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; min-width: 70px; }
+  .col-picker-item .col-desc { color: var(--muted); font-size: 11px; }
+  .sidebar-footer { padding: 10px 16px; border-top: 1px solid var(--border); }
+  .btn-icon { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 4px; background: white; cursor: pointer; font-size: 12px; color: var(--muted); }
+  .btn-icon:hover { background: #eee; color: var(--text); }
+  .btn-icon svg { width: 14px; height: 14px; }
+
+  /* Clickable help triggers */
+  .help-link { cursor: pointer; border-bottom: 1.5px dashed #94a3b8; }
+  .help-link:hover { border-bottom-color: var(--accent); color: var(--accent); }
+  .metrics-table th.help-link { cursor: pointer; }
+  .metrics-table th.help-link:hover { color: var(--accent); }
+  .param-card.help-link:hover { border-color: var(--accent); }
+  .node-configs-table th.help-link { cursor: pointer; border-bottom: 1.5px dashed #94a3b8; }
+  .node-configs-table th.help-link:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-header">
+    <h2>Backtest Runs</h2>
+    <button class="btn btn-primary" onclick="openModal()">+ New Run</button>
+  </div>
+  <div class="run-list" id="runList"></div>
+  <div class="sidebar-footer">
+    <button class="btn-icon" onclick="openColumnPicker()">
+      <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"/></svg>
+      Columns
+    </button>
+  </div>
+</div>
+
+<div class="main" id="mainPanel">
+  <div class="placeholder">Select a run from the sidebar</div>
+</div>
+
+<!-- New Run Modal -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <h2>Launch New Backtest</h2>
+    <form id="newRunForm" onsubmit="return submitRun(event)">
+      <div class="form-group">
+        <label>Run Name</label>
+        <input name="run_name" value="new_run" required>
+      </div>
+      <div class="form-group">
+        <label>Data Path (NPZ file)</label>
+        <input name="data_path" placeholder="/path/to/data.npz" required>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Mode</label>
+          <select name="mode">
+            <option value="single">Single split</option>
+            <option value="expanding">Expanding window</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Test Size</label>
+          <input name="test_size" type="number" value="12">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>N Splits</label>
+          <input name="n_splits" type="number" value="3">
+        </div>
+        <div class="form-group">
+          <label>Reconciliation</label>
+          <select name="reconciliation">
+            <option value="bottom_up">Bottom Up</option>
+            <option value="soft">Soft</option>
+            <option value="none">None</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Warmup</label>
+          <input name="num_warmup" type="number" value="200">
+        </div>
+        <div class="form-group">
+          <label>Samples</label>
+          <input name="num_samples" type="number" value="500">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Chains</label>
+          <input name="num_chains" type="number" value="1">
+        </div>
+        <div class="form-group">
+          <label>RNG Seed</label>
+          <input name="rng_seed" type="number" value="0">
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="closeModal()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Launch</button>
+      </div>
+    </form>
+    <div id="progressArea" style="display:none; margin-top: 16px;">
+      <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+      <div class="progress-text" id="progressText">Starting...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Column Picker -->
+<div class="col-picker-overlay" id="colPickerOverlay" onclick="if(event.target===this)closeColumnPicker()">
+  <div class="col-picker">
+    <div class="col-picker-header">
+      <h3>Visible Metrics</h3>
+      <div class="actions">
+        <button class="btn" style="padding:3px 8px;font-size:11px" onclick="setAllColumns(true)">All</button>
+        <button class="btn" style="padding:3px 8px;font-size:11px" onclick="setAllColumns(false)">None</button>
+      </div>
+    </div>
+    <div class="col-picker-body" id="colPickerBody"></div>
+  </div>
+</div>
+
+<!-- Help Modal -->
+<div class="help-modal-overlay" id="helpOverlay" onclick="if(event.target===this)closeHelp()">
+  <div class="help-modal">
+    <div class="help-modal-header">
+      <h2 id="helpTitle">Glossary</h2>
+      <button class="help-modal-close" onclick="closeHelp()">&times;</button>
+    </div>
+    <div class="help-modal-body" id="helpBody"></div>
+  </div>
+</div>
+
+<script>
+const FOLD_COLORS = ['#2563eb','#dc2626','#16a34a','#9333ea','#ea580c','#0891b2','#ca8a04','#db2777'];
+let selectedRunId = null;
+
+// ---------------------------------------------------------------------------
+// Glossary — all definitions in one place
+// ---------------------------------------------------------------------------
+
+const GLOSSARY = {
+  // -- Metrics --
+  mae: {
+    section: 'Metrics',
+    name: 'MAE',
+    aka: 'Mean Absolute Error',
+    body: 'Average of the absolute differences between the median forecast and the actual values across all forecast time steps.',
+    formula: 'MAE = (1/H) &sum; |y&#x302;<sub>t</sub> &minus; y<sub>t</sub>|',
+    tags: ['lower is better', 'absolute scale'],
+  },
+  rmse: {
+    section: 'Metrics',
+    name: 'RMSE',
+    aka: 'Root Mean Squared Error',
+    body: 'Square root of the average squared forecast errors. Penalizes large errors more heavily than MAE, making it sensitive to outliers.',
+    formula: 'RMSE = &radic;((1/H) &sum; (y&#x302;<sub>t</sub> &minus; y<sub>t</sub>)&sup2;)',
+    tags: ['lower is better', 'absolute scale'],
+  },
+  mape: {
+    section: 'Metrics',
+    name: 'MAPE',
+    aka: 'Mean Absolute Percentage Error',
+    body: 'Average absolute error as a percentage of actual values. Intuitive but undefined when actuals are zero and asymmetric (over-predictions penalized less than under).',
+    formula: 'MAPE = (100/H) &sum; |y&#x302;<sub>t</sub> &minus; y<sub>t</sub>| / |y<sub>t</sub>|',
+    tags: ['lower is better', 'percentage'],
+  },
+  smape: {
+    section: 'Metrics',
+    name: 'sMAPE',
+    aka: 'Symmetric Mean Absolute Percentage Error',
+    body: 'A symmetric variant of MAPE bounded between 0% and 200%. Handles near-zero actuals more gracefully than MAPE by dividing by the average of actual and predicted.',
+    formula: 'sMAPE = (100/H) &sum; 2|y&#x302;<sub>t</sub> &minus; y<sub>t</sub>| / (|y&#x302;<sub>t</sub>| + |y<sub>t</sub>|)',
+    tags: ['lower is better', 'percentage'],
+  },
+  rolling_mape_3: {
+    section: 'Metrics',
+    name: 'rMAPE(3)',
+    aka: 'Rolling MAPE, window=3',
+    body: 'MAPE computed on each rolling 3-period window across the forecast horizon, then averaged. Smooths out single-period spikes and gives a local accuracy view.',
+    tags: ['lower is better', 'percentage'],
+  },
+  rolling_mape_6: {
+    section: 'Metrics',
+    name: 'rMAPE(6)',
+    aka: 'Rolling MAPE, window=6',
+    body: 'Same as rMAPE(3) but with a 6-period rolling window. More stable for longer horizons. Returns NaN if the horizon is shorter than 6 periods.',
+    tags: ['lower is better', 'percentage'],
+  },
+  mape_full: {
+    section: 'Metrics',
+    name: 'MAPE(full)',
+    aka: 'Full-Horizon MAPE',
+    body: 'MAPE computed on the sum of the entire forecast horizon: <code>|Σŷ − Σy| / |Σy| × 100</code>. A single number that measures how well the cumulative forecast tracks the cumulative actual over the whole horizon. Useful for assessing total-volume accuracy.',
+    formula: 'MAPE(full) = |&sum;ŷ<sub>t</sub> − &sum;y<sub>t</sub>| / |&sum;y<sub>t</sub>| &times; 100',
+    tags: ['lower is better', 'percentage'],
+  },
+  accuracy: {
+    section: 'Metrics',
+    name: 'Accuracy',
+    aka: 'Clipped Percentage Accuracy',
+    body: 'Mean of <code>1 − clip(|ŷ − y| / |y|, 0, 1)</code> across horizon steps. A value of 1.0 (100%) means perfect forecasts; 0.0 means every step is off by 100% or more. Errors beyond 100% are capped so a single outlier cannot make accuracy negative.',
+    formula: 'Accuracy = (1/H) &sum; (1 − min(|ŷ<sub>t</sub> − y<sub>t</sub>| / |y<sub>t</sub>|, 1))',
+    tags: ['higher is better', 'percentage'],
+  },
+  rolling_accuracy_3: {
+    section: 'Metrics',
+    name: 'rAcc(3)',
+    aka: 'Rolling Accuracy, window=3',
+    body: 'Accuracy computed on rolling 3-period cumulative sums: <code>1 − clip(|Σŷ − Σy| / |Σy|, 0, 1)</code> for each window, then averaged. Measures how well the model captures local 3-period totals.',
+    tags: ['higher is better', 'percentage'],
+  },
+  rolling_accuracy_6: {
+    section: 'Metrics',
+    name: 'rAcc(6)',
+    aka: 'Rolling Accuracy, window=6',
+    body: 'Same as rAcc(3) but with a 6-period window. More stable for longer horizons. Returns NaN if the horizon is shorter than 6 periods.',
+    tags: ['higher is better', 'percentage'],
+  },
+  accuracy_full: {
+    section: 'Metrics',
+    name: 'Acc(full)',
+    aka: 'Full-Horizon Accuracy',
+    body: 'Accuracy computed on the sum of the entire forecast horizon: <code>1 − clip(|Σŷ − Σy| / |Σy|, 0, 1)</code>. Measures how well the total forecasted volume matches the total actual volume over the whole horizon.',
+    formula: 'Acc(full) = 1 − min(|&sum;ŷ<sub>t</sub> − &sum;y<sub>t</sub>| / |&sum;y<sub>t</sub>|, 1)',
+    tags: ['higher is better', 'percentage'],
+  },
+  coverage: {
+    section: 'Metrics',
+    name: 'Coverage',
+    aka: 'Prediction Interval Coverage',
+    body: 'Fraction of actual values that fall inside the 90% prediction interval (5th to 95th percentile of the posterior predictive distribution). Ideally close to 90%. Well below 90% means the model is overconfident; well above means it is too wide.',
+    formula: 'Coverage = (1/H) &sum; 1[q<sub>5</sub> &le; y<sub>t</sub> &le; q<sub>95</sub>]',
+    tags: ['higher is better', 'percentage'],
+  },
+  crps: {
+    section: 'Metrics',
+    name: 'CRPS',
+    aka: 'Continuous Ranked Probability Score',
+    body: 'A strictly proper scoring rule that evaluates the full forecast distribution, not just the point estimate. It rewards both accuracy and sharpness. Equivalent to MAE for deterministic forecasts. Uses the energy form: <code>E|X - y| - 0.5 * E|X - X\'|</code> where X, X\' are independent draws.',
+    tags: ['lower is better', 'absolute scale'],
+  },
+
+  // -- Run Config Parameters --
+  mode: {
+    section: 'Run Parameters',
+    name: 'Mode',
+    body: '<strong>single</strong> &mdash; One train/test split at the end of the series.<br><strong>expanding</strong> &mdash; Multiple folds with an expanding training window. Each successive fold adds more history.',
+  },
+  test_size: {
+    section: 'Run Parameters',
+    name: 'Horizon / Test Size',
+    body: 'Number of time steps in each forecast (test) window. This is the forecast horizon &mdash; how many periods ahead the model predicts in each fold.',
+  },
+  n_splits: {
+    section: 'Run Parameters',
+    name: 'Folds / N Splits',
+    body: 'Number of backtest folds for <code>expanding</code> mode. Each fold uses a different train/test cutoff. More folds give a more robust average metric at the cost of longer runtime.',
+  },
+  reconciliation: {
+    section: 'Run Parameters',
+    name: 'Reconciliation',
+    body: '<strong>bottom_up</strong> &mdash; Forecast children independently, then aggregate upward to parents by summing. Guarantees coherence.<br><strong>soft</strong> &mdash; Jointly model parent and children with a soft coherence penalty in the likelihood.<br><strong>none</strong> &mdash; Forecast each node independently with no hierarchy constraints.',
+  },
+  num_warmup: {
+    section: 'Run Parameters',
+    name: 'Warmup',
+    body: 'Number of NUTS (No-U-Turn Sampler) warmup iterations. During warmup the sampler tunes step size and mass matrix. These samples are discarded. More warmup helps mixing but increases runtime.',
+  },
+  num_samples: {
+    section: 'Run Parameters',
+    name: 'Samples',
+    body: 'Number of posterior samples drawn after warmup. These form the posterior predictive distribution used for forecasts and uncertainty intervals. More samples = smoother posteriors.',
+  },
+  num_chains: {
+    section: 'Run Parameters',
+    name: 'Chains',
+    body: 'Number of independent MCMC chains to run. Multiple chains help diagnose convergence (via R-hat). Each chain starts from a different random initialization.',
+  },
+  rng_seed: {
+    section: 'Run Parameters',
+    name: 'RNG Seed',
+    body: 'Base pseudo-random number generator seed. Incremented per fold for reproducibility. Set the same seed to get identical results across runs.',
+  },
+  T: {
+    section: 'Run Parameters',
+    name: 'T (observations)',
+    body: 'Total number of time periods in the shortest input series. This determines the maximum training + test window available.',
+  },
+  n_internal: {
+    section: 'Run Parameters',
+    name: 'Internal Series',
+    body: 'Number of endogenous (target) time series in the hierarchy. These are the series being forecast.',
+  },
+  n_external: {
+    section: 'Run Parameters',
+    name: 'External Series',
+    body: 'Number of exogenous predictor series from the causal DAG. These are used as inputs (regressors) but not forecast.',
+  },
+  elapsed: {
+    section: 'Run Parameters',
+    name: 'Elapsed',
+    body: 'Wall-clock time for the full backtest run, including all folds. Dominated by MCMC sampling time.',
+  },
+
+  // -- Node Configuration --
+  prior_alpha: {
+    section: 'Node Config',
+    name: 'prior_alpha',
+    body: 'Prior distribution parameters for the trend damping factor (alpha). Given as <code>[shape, rate]</code> for a Gamma prior. Controls how quickly the trend reverts to the mean. Smaller alpha = more damped.',
+  },
+  reconciliation_sigma: {
+    section: 'Node Config',
+    name: 'reconciliation_sigma',
+    body: 'Standard deviation of the soft reconciliation penalty. Only used when <code>reconciliation=soft</code>. Smaller values enforce tighter coherence between parent and sum-of-children.',
+  },
+  components: {
+    section: 'Node Config',
+    name: 'components',
+    body: 'Tuple of component instances controlling this node\'s dynamics (e.g. <code>LocalLinearTrend()</code>, <code>FourierSeasonality(n_harmonics=2)</code>). Components are combined by the aggregator. When <code>null</code>, defaults to a single <code>LocalLinearTrend()</code>. Each component is shown as <code>type(params)</code>.',
+    tags: ['optional'],
+  },
+  aggregator: {
+    section: 'Node Config',
+    name: 'aggregator',
+    body: 'How component contributions are combined into the predicted mean. Options: <strong>additive</strong> (default, sum all), <strong>multiplicative</strong> (product all), <strong>log_additive</strong> (sum in log-space, exponentiate), <strong>multiplicative_seasonality</strong> ((trend + regression) &times; seasonality). When <code>null</code>, defaults to additive.',
+    tags: ['optional'],
+  },
+  component_library: {
+    section: 'Structure',
+    name: 'Component Library',
+    body: 'Reference table of all registered dynamics components and aggregators. Components auto-register via <code>__init_subclass__</code> — define a custom component by subclassing with a <code>name</code> keyword: <code>class MyTrend(TrendComponent, name="my_trend")</code>. The library is extensible at runtime.',
+  },
+
+  // -- Chart Elements --
+  observed: {
+    section: 'Chart Elements',
+    name: 'Observed (black line)',
+    body: 'Full historical time series for this node. Only shown when <code>y_data.npz</code> was saved alongside the run.',
+  },
+  forecast_median: {
+    section: 'Chart Elements',
+    name: 'Median Forecast',
+    body: 'The 50th percentile (median) of the posterior predictive samples at each time step. This is the point forecast used for MAE/RMSE/MAPE calculations.',
+  },
+  ci_90: {
+    section: 'Chart Elements',
+    name: '90% Prediction Interval',
+    body: 'The light shaded band from the 5th to 95th percentile of posterior predictive samples. 90% of forecast density falls in this region. Coverage measures how often actuals land inside.',
+  },
+  ci_50: {
+    section: 'Chart Elements',
+    name: '50% Prediction Interval',
+    body: 'The darker inner band from the 25th to 75th percentile. Shows the core of the forecast distribution.',
+  },
+  cutoff_line: {
+    section: 'Chart Elements',
+    name: 'Cutoff Line (dashed)',
+    body: 'Vertical dashed line marking the end of the training window. Everything to the left was seen during fitting; everything to the right is the out-of-sample forecast being evaluated.',
+  },
+  actual_test: {
+    section: 'Chart Elements',
+    name: 'Actual (test)',
+    body: 'Ground truth values in the forecast window (dotted line with markers). These are compared against the forecast to compute all metrics.',
+  },
+
+  // -- Hierarchy & DAG --
+  hierarchy: {
+    section: 'Structure',
+    name: 'Hierarchy',
+    body: 'Parent-child aggregation relationships. Each parent should equal the sum of its children (e.g. Total = Region A + Region B). Blue nodes are parents, green nodes are children.',
+  },
+  causal_dag: {
+    section: 'Structure',
+    name: 'Causal DAG',
+    body: 'Directed acyclic graph of predictive relationships. Diamond nodes are external predictors; circle nodes are internal (forecast) series. Edge labels show the lag (e.g. <code>lag=1</code> means the predictor at time t-1 affects the target at time t).',
+  },
+  node: {
+    section: 'Structure',
+    name: 'Node',
+    body: 'A single time series in the hierarchy, identified by its ModelKey dimensions and values (e.g. <code>CATEGORY=HE, VMS=Education</code>). Each node gets its own forecast model within the hierarchical framework.',
+  },
+
+  // -- Backtest Concepts --
+  fold: {
+    section: 'Backtest Concepts',
+    name: 'Fold',
+    body: 'One train/test split in the backtest. The model is fit on data up to the cutoff, then forecasts the next <code>test_size</code> periods. In expanding mode, each successive fold has a later cutoff and more training data.',
+  },
+  cutoff: {
+    section: 'Backtest Concepts',
+    name: 'Cutoff',
+    body: 'The time index where training ends and the forecast window begins. For a cutoff of 48 with test_size=12, training uses periods 0-47 and the forecast covers periods 48-59.',
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Help modal logic
+// ---------------------------------------------------------------------------
+
+function openHelp(key) {
+  const overlay = document.getElementById('helpOverlay');
+  const body = document.getElementById('helpBody');
+  const title = document.getElementById('helpTitle');
+
+  // Render all entries, grouped by section
+  const sections = {};
+  for (const [k, entry] of Object.entries(GLOSSARY)) {
+    const sec = entry.section || 'Other';
+    if (!sections[sec]) sections[sec] = [];
+    sections[sec].push({ key: k, ...entry });
+  }
+
+  const sectionOrder = ['Metrics', 'Run Parameters', 'Node Config', 'Chart Elements', 'Structure', 'Backtest Concepts'];
+  let html = '';
+  for (const sec of sectionOrder) {
+    const entries = sections[sec];
+    if (!entries) continue;
+    html += `<div class="help-section-title">${esc(sec)}</div>`;
+    for (const e of entries) {
+      html += `<div class="help-entry" id="help-${e.key}">`;
+      html += `<div class="help-entry-name">${e.name}</div>`;
+      if (e.aka) html += `<div class="help-entry-aka">${esc(e.aka)}</div>`;
+      html += `<div class="help-entry-body">${e.body}</div>`;
+      if (e.formula) html += `<div class="help-entry-formula">${e.formula}</div>`;
+      if (e.tags && e.tags.length) {
+        html += '<div class="help-entry-tags">';
+        e.tags.forEach(t => {
+          const cls = t.includes('lower') ? 'help-tag-lower' : t.includes('higher') ? 'help-tag-higher' : t.includes('pct') || t.includes('percentage') ? 'help-tag-pct' : 'help-tag-abs';
+          html += `<span class="help-tag ${cls}">${esc(t)}</span>`;
+        });
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+  }
+
+  title.textContent = key ? (GLOSSARY[key]?.name || 'Glossary') : 'Glossary';
+  body.innerHTML = html;
+  overlay.classList.add('open');
+
+  // Scroll to the specific entry if a key was given
+  if (key) {
+    requestAnimationFrame(() => {
+      const el = document.getElementById('help-' + key);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }
+}
+
+function closeHelp() {
+  document.getElementById('helpOverlay').classList.remove('open');
+}
+
+// Close help on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeHelp(); closeColumnPicker(); }
+});
+
+// Map from various labels to glossary keys
+const HELP_KEY_MAP = {
+  // Metric columns
+  mae: 'mae', rmse: 'rmse', mape: 'mape', smape: 'smape',
+  rolling_mape_3: 'rolling_mape_3', rolling_mape_6: 'rolling_mape_6', mape_full: 'mape_full',
+  accuracy: 'accuracy', rolling_accuracy_3: 'rolling_accuracy_3', rolling_accuracy_6: 'rolling_accuracy_6', accuracy_full: 'accuracy_full',
+  coverage: 'coverage', crps: 'crps',
+  // Param cards
+  'mode': 'mode', 'horizon': 'test_size', 'folds': 'n_splits',
+  'reconciliation': 'reconciliation', 'warmup': 'num_warmup',
+  'samples': 'num_samples', 'chains': 'num_chains', 'rng seed': 'rng_seed',
+  't (observations)': 'T', 'internal series': 'n_internal',
+  'external series': 'n_external', 'elapsed': 'elapsed',
+  // Node config fields
+  'prior_alpha': 'prior_alpha',
+  'reconciliation_sigma': 'reconciliation_sigma',
+  'components': 'components', 'aggregator': 'aggregator',
+};
+
+function helpKeyFor(label) {
+  const lower = label.toLowerCase().trim();
+  return HELP_KEY_MAP[lower] || HELP_KEY_MAP[label] || null;
+}
+
+const METRIC_DISPLAY_NAMES = {
+  mae: 'MAE', rmse: 'RMSE', mape: 'MAPE', smape: 'sMAPE',
+  rolling_mape_3: 'rMAPE(3)', rolling_mape_6: 'rMAPE(6)', mape_full: 'MAPE(full)',
+  accuracy: 'Accuracy', rolling_accuracy_3: 'rAcc(3)', rolling_accuracy_6: 'rAcc(6)', accuracy_full: 'Acc(full)',
+  coverage: 'Coverage', crps: 'CRPS',
+};
+
+// ---------------------------------------------------------------------------
+// Global column visibility — persisted in localStorage
+// ---------------------------------------------------------------------------
+
+// Preferred column order (must be defined before ALL_METRIC_KEYS)
+const COL_ORDER = ['mae', 'rmse', 'mape', 'smape', 'rolling_mape_3', 'rolling_mape_6', 'mape_full', 'accuracy', 'rolling_accuracy_3', 'rolling_accuracy_6', 'accuracy_full', 'coverage', 'crps'];
+const ALL_METRIC_KEYS = COL_ORDER;
+let visibleMetrics = new Set(ALL_METRIC_KEYS); // default: all visible
+
+function loadColumnPrefs() {
+  try {
+    const saved = localStorage.getItem('ergodicts_visible_metrics');
+    if (saved) {
+      const arr = JSON.parse(saved);
+      if (Array.isArray(arr) && arr.length > 0) {
+        visibleMetrics = new Set(arr.filter(k => ALL_METRIC_KEYS.includes(k)));
+      }
+    }
+  } catch(e) {}
+}
+
+function saveColumnPrefs() {
+  localStorage.setItem('ergodicts_visible_metrics', JSON.stringify([...visibleMetrics]));
+}
+
+function openColumnPicker() {
+  const body = document.getElementById('colPickerBody');
+  let html = '';
+  ALL_METRIC_KEYS.forEach(k => {
+    const display = METRIC_DISPLAY_NAMES[k] || k;
+    const desc = GLOSSARY[k]?.aka || '';
+    const checked = visibleMetrics.has(k) ? 'checked' : '';
+    html += `<label class="col-picker-item">
+      <input type="checkbox" ${checked} onchange="toggleColumn('${k}', this.checked)">
+      <span class="col-name">${esc(display)}</span>
+      <span class="col-desc">${esc(desc)}</span>
+    </label>`;
+  });
+  body.innerHTML = html;
+  document.getElementById('colPickerOverlay').classList.add('open');
+}
+
+function closeColumnPicker() {
+  document.getElementById('colPickerOverlay').classList.remove('open');
+}
+
+function toggleColumn(key, on) {
+  if (on) visibleMetrics.add(key);
+  else visibleMetrics.delete(key);
+  // Ensure at least one column stays visible
+  if (visibleMetrics.size === 0) {
+    visibleMetrics.add(key);
+    // Re-check the checkbox we just unchecked
+    const cb = document.querySelector(`#colPickerBody input[onchange*="'${key}'"]`);
+    if (cb) cb.checked = true;
+    return;
+  }
+  saveColumnPrefs();
+  refreshCurrentView();
+}
+
+function setAllColumns(on) {
+  if (on) {
+    visibleMetrics = new Set(ALL_METRIC_KEYS);
+  } else {
+    // Keep only the first metric
+    visibleMetrics = new Set([ALL_METRIC_KEYS[0]]);
+  }
+  saveColumnPrefs();
+  // Refresh checkboxes
+  openColumnPicker();
+  refreshCurrentView();
+}
+
+function refreshCurrentView() {
+  // Re-render the current run if one is selected
+  if (selectedRunId) selectRun(selectedRunId);
+}
+
+loadColumnPrefs();
+
+const PCT_METRICS = new Set(['mape', 'smape', 'rolling_mape_3', 'rolling_mape_6', 'mape_full']);
+const FRAC_TO_PCT_METRICS = new Set(['coverage', 'accuracy', 'rolling_accuracy_3', 'rolling_accuracy_6', 'accuracy_full']);  // stored as 0-1, display as %
+const ABS_METRICS = new Set(['mae', 'rmse', 'crps']);
+const ERROR_PCT_METRICS = new Set(['mape', 'smape', 'rolling_mape_3', 'rolling_mape_6', 'mape_full']);
+
+function fmtAbbrev(v) {
+  if (v == null || isNaN(v)) return '\u2014';
+  const abs = Math.abs(v);
+  if (abs >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+  if (abs >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (abs >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return v.toFixed(1);
+}
+
+function fmtPct(v) {
+  if (v == null || isNaN(v)) return '\u2014';
+  return v.toFixed(1) + '%';
+}
+
+function fmtMetric(col, v) {
+  if (typeof v !== 'number') return v;
+  if (FRAC_TO_PCT_METRICS.has(col)) return fmtPct(v * 100);
+  if (PCT_METRICS.has(col)) return fmtPct(v);
+  if (ABS_METRICS.has(col)) return fmtAbbrev(v);
+  return v.toFixed(2);
+}
+
+function colorForErrorPct(v) {
+  // green (<15) -> yellow (30) -> red (>50)
+  if (v == null || isNaN(v)) return '';
+  const clamped = Math.max(0, Math.min(v, 60));
+  if (clamped <= 15) {
+    const t = clamped / 15;
+    return `rgba(34,197,94,${0.08 + t * 0.12})`;  // green tint
+  }
+  if (clamped <= 30) {
+    const t = (clamped - 15) / 15;
+    return `rgba(234,179,8,${0.08 + t * 0.15})`;  // yellow tint
+  }
+  const t = (clamped - 30) / 30;
+  return `rgba(239,68,68,${0.10 + t * 0.18})`;  // red tint
+}
+
+function colorForCoverage(v) {
+  if (v == null || isNaN(v)) return '';
+  if (v >= 90) return 'rgba(34,197,94,0.12)';
+  if (v >= 80) return 'rgba(234,179,8,0.12)';
+  return 'rgba(239,68,68,0.15)';
+}
+
+function colorForAccuracy(v) {
+  if (v == null || isNaN(v)) return '';
+  if (v >= 95) return 'rgba(34,197,94,0.12)';
+  if (v >= 85) return 'rgba(234,179,8,0.12)';
+  return 'rgba(239,68,68,0.15)';
+}
+
+const ACCURACY_METRICS = new Set(['accuracy', 'rolling_accuracy_3', 'rolling_accuracy_6', 'accuracy_full']);
+
+function cellStyle(col, v) {
+  if (typeof v !== 'number') return '';
+  if (ERROR_PCT_METRICS.has(col)) { const c = colorForErrorPct(v); return c ? `background:${c}` : ''; }
+  if (col === 'coverage') { const c = colorForCoverage(v * 100); return c ? `background:${c}` : ''; }
+  if (ACCURACY_METRICS.has(col)) { const c = colorForAccuracy(v * 100); return c ? `background:${c}` : ''; }
+  return '';
+}
+
+function sortCols(cols) {
+  const order = {};
+  COL_ORDER.forEach((c, i) => { order[c] = i; });
+  return [...cols].sort((a, b) => {
+    const oa = order[a] !== undefined ? order[a] : 99;
+    const ob = order[b] !== undefined ? order[b] : 99;
+    return oa - ob;
+  });
+}
+
+function isAggregate(nodeName) {
+  // Aggregate node has no @ separator (e.g. "HE" vs "HE@Something")
+  return !nodeName.includes('@');
+}
+
+function sortRows(rows) {
+  // Aggregates first, then alphabetical
+  return [...rows].sort((a, b) => {
+    const aAgg = isAggregate(a.node || '');
+    const bAgg = isAggregate(b.node || '');
+    if (aAgg && !bAgg) return -1;
+    if (!aAgg && bAgg) return 1;
+    return (a.node || '').localeCompare(b.node || '');
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Build metrics table HTML (reused for summary + fold tables)
+// ---------------------------------------------------------------------------
+
+function buildMetricsTable(rows, cols) {
+  const sortedCols = sortCols(cols).filter(c => visibleMetrics.has(c));
+  const sortedRows = sortRows(rows);
+
+  let html = '<div class="metrics-wrap"><table class="metrics-table"><thead><tr><th class="help-link" onclick="openHelp(\'node\')">Node</th>';
+  sortedCols.forEach(c => {
+    const display = METRIC_DISPLAY_NAMES[c] || c;
+    const tip = GLOSSARY[c]?.aka || GLOSSARY[c]?.body || '';
+    const shortTip = tip.length > 100 ? tip.slice(0, 97) + '...' : tip;
+    html += `<th class="help-link" title="${esc(shortTip)}" onclick="openHelp('${c}')">${esc(display)}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+
+  sortedRows.forEach(row => {
+    const node = row.node || '';
+    const agg = isAggregate(node);
+    html += `<tr class="${agg ? 'row-aggregate' : ''}"><td>${esc(node)}</td>`;
+    sortedCols.forEach(c => {
+      const v = row[c];
+      const style = cellStyle(c, v);
+      html += `<td${style ? ` style="${style}"` : ''}>${fmtMetric(c, v)}</td>`;
+    });
+    html += '</tr>';
+  });
+
+  html += '</tbody></table></div>';
+  return html;
+}
+
+// ---------------------------------------------------------------------------
+// Run config section
+// ---------------------------------------------------------------------------
+
+function formatConfigValue(field, value) {
+  if (field === 'components' && Array.isArray(value)) {
+    return value.map(c => {
+      if (c && typeof c === 'object' && c.type) {
+        const paramStr = Object.entries(c.params || {}).map(([k,v]) => `${k}=${v}`).join(', ');
+        return paramStr ? `${c.type}(${paramStr})` : c.type;
+      }
+      return String(c);
+    }).join(' + ');
+  }
+  if (field === 'aggregator' && value && typeof value === 'object' && value.type) {
+    return value.type;
+  }
+  if (Array.isArray(value)) return value.join(', ');
+  return String(value != null ? value : '');
+}
+
+async function loadComponentLibrary() {
+  const container = document.getElementById('componentLibrary');
+  if (!container) return;
+  try {
+    const res = await fetch('/api/components');
+    const lib = await res.json();
+    const roleOrder = ['trend', 'seasonality', 'regression', 'aggregator'];
+    const entries = Object.entries(lib).sort((a, b) => {
+      const ra = roleOrder.indexOf(a[1].role), rb = roleOrder.indexOf(b[1].role);
+      if (ra !== rb) return ra - rb;
+      return a[0].localeCompare(b[0]);
+    });
+
+    let html = '<table class="node-configs-table"><thead><tr>';
+    html += '<th>Name</th><th>Role</th><th>Description</th><th>Parameters</th>';
+    html += '</tr></thead><tbody>';
+    for (const [name, info] of entries) {
+      const paramStr = Object.entries(info.params || {})
+        .map(([p, v]) => `${p}: ${v.annotation}=${v.default ?? '?'}`)
+        .join(', ');
+      const roleBadge = `<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:0.75rem;background:${
+        info.role === 'trend' ? '#dbeafe' : info.role === 'seasonality' ? '#dcfce7' :
+        info.role === 'regression' ? '#fef3c7' : '#f3e8ff'
+      };color:#333">${esc(info.role)}</span>`;
+      html += `<tr>`;
+      html += `<td><code>${esc(name)}</code></td>`;
+      html += `<td>${roleBadge}</td>`;
+      html += `<td>${esc(info.description)}</td>`;
+      html += `<td><code>${esc(paramStr || 'none')}</code></td>`;
+      html += `</tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="dag-placeholder">Failed to load component library</div>';
+  }
+}
+
+function buildConfigSection(cfg) {
+  const kwargs = cfg.run_kwargs || {};
+  const info = cfg.data_info || {};
+
+  let html = '<div class="config-section">';
+  html += '<div class="config-toggle" onclick="toggleConfig(this)"><span class="arrow">&#9654;</span> Run Configuration</div>';
+  html += '<div class="config-body">';
+
+  // -- Parameters grid
+  const params = [
+    ['Mode', kwargs.mode || '?'],
+    ['Horizon', kwargs.test_size || '?'],
+    ['Folds', kwargs.n_splits || '?'],
+    ['Reconciliation', cfg.reconciliation || '?'],
+    ['Warmup', kwargs.num_warmup || '?'],
+    ['Samples', kwargs.num_samples || '?'],
+    ['Chains', kwargs.num_chains || '?'],
+    ['RNG Seed', kwargs.rng_seed ?? '?'],
+    ['T (observations)', info.T || '?'],
+    ['Internal series', info.n_internal_series || 0],
+    ['External series', info.n_external_series || 0],
+    ['Elapsed', (cfg.elapsed_seconds || 0).toFixed(1) + 's'],
+  ];
+  html += '<div class="params-grid">';
+  params.forEach(([label, value]) => {
+    const hk = helpKeyFor(label);
+    const clickAttr = hk ? ` onclick="openHelp('${hk}')"` : '';
+    const cls = hk ? 'param-card help-link' : 'param-card';
+    html += `<div class="${cls}"${clickAttr}><div class="label">${esc(label)}</div><div class="value">${esc(String(value))}</div></div>`;
+  });
+  html += '</div>';
+
+  // -- Hierarchy DAG
+  html += '<div class="sub-section-title help-link" onclick="openHelp(\'hierarchy\')">Hierarchy</div>';
+  const hEdges = cfg.hierarchy_edges || [];
+  if (hEdges.length > 0) {
+    html += `<div id="hierarchyDag" style="height:320px; border:1px solid var(--border); border-radius:6px; background:white;"></div>`;
+  } else {
+    html += '<div class="dag-placeholder">No hierarchy edges defined</div>';
+  }
+
+  // -- Causal DAG
+  html += '<div class="sub-section-title help-link" onclick="openHelp(\'causal_dag\')">Causal DAG</div>';
+  const cEdges = cfg.dag_edges || [];
+  if (cEdges.length > 0) {
+    html += `<div id="causalDag" style="height:320px; border:1px solid var(--border); border-radius:6px; background:white;"></div>`;
+  } else {
+    html += '<div class="dag-placeholder">No external predictors</div>';
+  }
+
+  // -- Node configs
+  html += '<div class="sub-section-title help-link" onclick="openHelp(\'components\')">Node Configurations</div>';
+  const ncfg = cfg.node_configs || {};
+  const nodeNames = Object.keys(ncfg);
+  if (nodeNames.length > 0) {
+    // Find which config fields vary
+    const allFields = new Set();
+    nodeNames.forEach(n => Object.keys(ncfg[n]).forEach(f => allFields.add(f)));
+    const fields = [...allFields].filter(f => {
+      const vals = new Set(nodeNames.map(n => JSON.stringify(ncfg[n][f])));
+      return vals.size > 1;
+    });
+    // If all uniform, show all fields for first row
+    const showFields = fields.length > 0 ? fields : [...allFields];
+    const uniformNote = fields.length === 0 ? ' (all nodes identical)' : '';
+
+    html += `<table class="node-configs-table"><thead><tr><th class="help-link" onclick="openHelp('node')">Node</th>`;
+    showFields.forEach(f => {
+      const hk = helpKeyFor(f);
+      if (hk) {
+        html += `<th class="help-link" onclick="openHelp('${hk}')">${esc(f)}</th>`;
+      } else {
+        html += `<th>${esc(f)}</th>`;
+      }
+    });
+    html += '</tr></thead><tbody>';
+
+    if (fields.length === 0) {
+      // All uniform — show one row
+      const first = nodeNames[0];
+      html += `<tr><td><em>All nodes</em></td>`;
+      showFields.forEach(f => {
+        html += `<td>${esc(formatConfigValue(f, ncfg[first][f]))}</td>`;
+      });
+      html += '</tr>';
+    } else {
+      // Sort: aggregates first
+      const sorted = [...nodeNames].sort((a, b) => {
+        const aAgg = !a.includes('@');
+        const bAgg = !b.includes('@');
+        if (aAgg && !bAgg) return -1;
+        if (!aAgg && bAgg) return 1;
+        return a.localeCompare(b);
+      });
+      sorted.forEach(n => {
+        html += `<tr><td>${esc(n)}</td>`;
+        showFields.forEach(f => {
+          html += `<td>${esc(formatConfigValue(f, ncfg[n][f]))}</td>`;
+        });
+        html += '</tr>';
+      });
+    }
+    html += '</tbody></table>';
+  } else {
+    html += '<div class="dag-placeholder">No node configurations</div>';
+  }
+
+  // -- Component Library
+  html += '<div class="sub-section-title help-link" onclick="openHelp(\'component_library\')">Component Library</div>';
+  html += '<div id="componentLibrary"><div class="dag-placeholder">Loading...</div></div>';
+
+  html += '</div></div>';
+  return html;
+}
+
+function toggleConfig(el) {
+  const arrow = el.querySelector('.arrow');
+  const body = el.nextElementSibling;
+  arrow.classList.toggle('open');
+  body.classList.toggle('open');
+
+  // Render DAGs + component library on first open
+  if (body.classList.contains('open') && !body.dataset.rendered) {
+    body.dataset.rendered = '1';
+    renderDags();
+    loadComponentLibrary();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DAG rendering with Plotly
+// ---------------------------------------------------------------------------
+
+function renderDags() {
+  if (!window._currentRunConfig) return;
+  const cfg = window._currentRunConfig;
+
+  // Hierarchy
+  const hEdges = cfg.hierarchy_edges || [];
+  if (hEdges.length > 0) {
+    renderHierarchyDag(hEdges, 'hierarchyDag');
+  }
+
+  // Causal
+  const cEdges = cfg.dag_edges || [];
+  if (cEdges.length > 0) {
+    renderCausalDag(cEdges, 'causalDag');
+  }
+}
+
+function renderHierarchyDag(edges, containerId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  // Build unique nodes and levels
+  const parents = new Map();  // label -> node
+  const children = new Map();
+  const parentChildren = new Map(); // parent label -> [child labels]
+
+  edges.forEach(e => {
+    const pLabel = e.parent.values.join('@');
+    const cLabel = e.child.values.join('@');
+    parents.set(pLabel, e.parent);
+    children.set(cLabel, e.child);
+    if (!parentChildren.has(pLabel)) parentChildren.set(pLabel, []);
+    parentChildren.get(pLabel).push(cLabel);
+  });
+
+  // Layout: parents on top row, children on bottom row
+  const parentLabels = [...parentChildren.keys()].sort();
+  const childLabels = [...new Set(edges.map(e => e.child.values.join('@')))].sort();
+
+  // Compute positions
+  const nodeX = {};
+  const nodeY = {};
+
+  parentLabels.forEach((p, i) => {
+    nodeX[p] = (i + 0.5) / Math.max(parentLabels.length, 1);
+    nodeY[p] = 1;
+  });
+
+  childLabels.forEach((c, i) => {
+    nodeX[c] = (i + 0.5) / Math.max(childLabels.length, 1);
+    nodeY[c] = 0;
+  });
+
+  // Build edge traces
+  const edgeX = [];
+  const edgeY = [];
+  edges.forEach(e => {
+    const pLabel = e.parent.values.join('@');
+    const cLabel = e.child.values.join('@');
+    edgeX.push(nodeX[pLabel], nodeX[cLabel], null);
+    edgeY.push(nodeY[pLabel], nodeY[cLabel], null);
+  });
+
+  const edgeTrace = {
+    x: edgeX, y: edgeY, mode: 'lines',
+    line: { color: '#94a3b8', width: 1.5 },
+    hoverinfo: 'none', showlegend: false,
+  };
+
+  // Parent nodes
+  const parentTrace = {
+    x: parentLabels.map(p => nodeX[p]),
+    y: parentLabels.map(p => nodeY[p]),
+    text: parentLabels,
+    mode: 'markers+text',
+    textposition: 'top center',
+    textfont: { size: 11, color: '#1e40af' },
+    marker: { size: 14, color: '#3b82f6', symbol: 'circle', line: { width: 2, color: '#1e40af' } },
+    hovertext: parentLabels.map(p => `${p} (${(parentChildren.get(p) || []).length} children)`),
+    hoverinfo: 'text',
+    showlegend: false,
+  };
+
+  // Child nodes
+  const childTrace = {
+    x: childLabels.map(c => nodeX[c]),
+    y: childLabels.map(c => nodeY[c]),
+    text: childLabels,
+    mode: 'markers+text',
+    textposition: 'bottom center',
+    textfont: { size: 10, color: '#065f46' },
+    marker: { size: 10, color: '#34d399', symbol: 'circle', line: { width: 1.5, color: '#065f46' } },
+    hovertext: childLabels,
+    hoverinfo: 'text',
+    showlegend: false,
+  };
+
+  const layout = {
+    margin: { l: 20, r: 20, t: 30, b: 30 },
+    xaxis: { visible: false, range: [-0.05, 1.05] },
+    yaxis: { visible: false, range: [-0.3, 1.4] },
+    paper_bgcolor: 'white', plot_bgcolor: 'white',
+    hovermode: 'closest',
+    annotations: [{
+      x: 0.5, y: 1.3, xref: 'paper', yref: 'y', text: 'Hierarchy',
+      showarrow: false, font: { size: 13, color: '#374151' },
+    }],
+  };
+
+  Plotly.newPlot(container, [edgeTrace, parentTrace, childTrace], layout, { responsive: true, displayModeBar: false });
+}
+
+function renderCausalDag(edges, containerId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  // Collect all nodes
+  const nodes = new Map();
+  edges.forEach(e => {
+    const sLabel = e.source_type === 'external' ? e.source.name : e.source.values.join('@');
+    const tLabel = e.target_type === 'external' ? e.target.name : e.target.values.join('@');
+    nodes.set(sLabel, { type: e.source_type, label: sLabel });
+    nodes.set(tLabel, { type: e.target_type, label: tLabel });
+  });
+
+  // Simple left-to-right layout: externals on left, model keys on right
+  const externals = [...nodes.entries()].filter(([, v]) => v.type === 'external').map(([k]) => k).sort();
+  const internals = [...nodes.entries()].filter(([, v]) => v.type !== 'external').map(([k]) => k).sort();
+
+  const nodeX = {};
+  const nodeY = {};
+
+  externals.forEach((n, i) => {
+    nodeX[n] = 0;
+    nodeY[n] = (i + 0.5) / Math.max(externals.length, 1);
+  });
+  internals.forEach((n, i) => {
+    nodeX[n] = 1;
+    nodeY[n] = (i + 0.5) / Math.max(internals.length, 1);
+  });
+
+  const edgeX = [];
+  const edgeY = [];
+  const edgeAnnotations = [];
+  edges.forEach(e => {
+    const sLabel = e.source_type === 'external' ? e.source.name : e.source.values.join('@');
+    const tLabel = e.target_type === 'external' ? e.target.name : e.target.values.join('@');
+    edgeX.push(nodeX[sLabel], nodeX[tLabel], null);
+    edgeY.push(nodeY[sLabel], nodeY[tLabel], null);
+    // Mid-point annotation for lag
+    const lagText = e.contemporaneous ? 'contemp' : `lag=${e.lag}`;
+    edgeAnnotations.push({
+      x: (nodeX[sLabel] + nodeX[tLabel]) / 2,
+      y: (nodeY[sLabel] + nodeY[tLabel]) / 2,
+      text: lagText, showarrow: false,
+      font: { size: 9, color: '#6b7280' },
+    });
+  });
+
+  const edgeTrace = {
+    x: edgeX, y: edgeY, mode: 'lines',
+    line: { color: '#94a3b8', width: 1.5 },
+    hoverinfo: 'none', showlegend: false,
+  };
+
+  const extTrace = {
+    x: externals.map(n => nodeX[n]),
+    y: externals.map(n => nodeY[n]),
+    text: externals, mode: 'markers+text',
+    textposition: 'middle left',
+    textfont: { size: 11, color: '#92400e' },
+    marker: { size: 12, color: '#fbbf24', symbol: 'diamond', line: { width: 1.5, color: '#92400e' } },
+    hoverinfo: 'text', showlegend: false,
+  };
+
+  const intTrace = {
+    x: internals.map(n => nodeX[n]),
+    y: internals.map(n => nodeY[n]),
+    text: internals, mode: 'markers+text',
+    textposition: 'middle right',
+    textfont: { size: 11, color: '#065f46' },
+    marker: { size: 12, color: '#34d399', symbol: 'circle', line: { width: 1.5, color: '#065f46' } },
+    hoverinfo: 'text', showlegend: false,
+  };
+
+  const layout = {
+    margin: { l: 20, r: 20, t: 30, b: 20 },
+    xaxis: { visible: false, range: [-0.4, 1.4] },
+    yaxis: { visible: false, range: [-0.1, 1.1] },
+    paper_bgcolor: 'white', plot_bgcolor: 'white',
+    hovermode: 'closest',
+    annotations: [{
+      x: 0.5, y: 1.08, xref: 'paper', yref: 'paper', text: 'Causal DAG',
+      showarrow: false, font: { size: 13, color: '#374151' },
+    }, ...edgeAnnotations],
+  };
+
+  Plotly.newPlot(container, [edgeTrace, extTrace, intTrace], layout, { responsive: true, displayModeBar: false });
+}
+
+// ---------------------------------------------------------------------------
+// Main app logic
+// ---------------------------------------------------------------------------
+
+async function loadRuns() {
+  const res = await fetch('/api/runs');
+  const runs = await res.json();
+  const list = document.getElementById('runList');
+  list.innerHTML = '';
+  runs.forEach(run => {
+    const div = document.createElement('div');
+    div.className = 'run-item' + (run.id === selectedRunId ? ' active' : '');
+    const status = run.status || 'completed';
+    const badgeClass = status === 'running' ? 'badge-running' : status === 'failed' ? 'badge-failed' : 'badge-completed';
+    div.innerHTML = `
+      <div class="name">${esc(run.run_name)} <span class="badge ${badgeClass}">${status}</span></div>
+      <div class="meta">${run.timestamp ? run.timestamp.replace('T', ' ') : 'in progress'} &middot; ${run.n_folds} folds &middot; ${run.n_series} series</div>
+    `;
+    div.onclick = () => selectRun(run.id);
+    list.appendChild(div);
+  });
+}
+
+async function selectRun(runId) {
+  selectedRunId = runId;
+  const panel = document.getElementById('mainPanel');
+  panel.innerHTML = '<div class="placeholder">Loading...</div>';
+
+  const res = await fetch(`/api/runs/${runId}`);
+  if (!res.ok) { panel.innerHTML = '<div class="placeholder">Failed to load run</div>'; return; }
+  const data = await res.json();
+
+  if (data.status === 'running') {
+    panel.innerHTML = '<div class="placeholder">Run is still in progress...</div>';
+    return;
+  }
+
+  const cfg = data.run_config || {};
+  const kwargs = cfg.run_kwargs || {};
+  const info = cfg.data_info || {};
+  window._currentRunConfig = cfg;
+
+  let html = `
+    <div class="detail-header">
+      <h1>${esc(cfg.run_name || runId)}</h1>
+      <div class="info">
+        ${cfg.timestamp || ''} &middot;
+        ${(cfg.elapsed_seconds || 0).toFixed(1)}s &middot;
+        ${data.n_folds} folds &middot;
+        horizon=${kwargs.test_size || '?'} &middot;
+        mode=${kwargs.mode || '?'} &middot;
+        ${info.n_internal_series || 0} series
+      </div>
+    </div>
+  `;
+
+  // Run config section (collapsible)
+  html += buildConfigSection(cfg);
+
+  // Summary table
+  try {
+    const sumRes = await fetch(`/api/runs/${runId}/summary`);
+    const rows = await sumRes.json();
+    if (rows.length > 0) {
+      const cols = Object.keys(rows[0]).filter(c => c !== 'node');
+      html += '<div class="section-title">Summary Metrics (avg across folds)</div>';
+      html += buildMetricsTable(rows, cols);
+    }
+  } catch(e) {}
+
+  // Charts placeholder
+  html += '<div class="section-title">Forecast Charts</div><div class="charts-section" id="chartsSection"><div class="placeholder" style="height:200px">Loading charts...</div></div>';
+
+  // Folds accordion
+  html += '<div class="section-title">Fold Details</div>';
+  for (let i = 0; i < data.n_folds; i++) {
+    const foldMeta = data.folds[i];
+    html += `
+      <div class="fold-header" onclick="toggleFold('${runId}', ${i})">
+        Fold ${i + 1} &mdash; cutoff=${foldMeta.cutoff}, horizon=${foldMeta.horizon}
+      </div>
+      <div class="fold-body" id="fold-${runId}-${i}"></div>
+    `;
+  }
+
+  panel.innerHTML = html;
+  loadRuns(); // refresh sidebar active state
+
+  // Load Plotly charts
+  loadCharts(runId);
+}
+
+async function loadCharts(runId) {
+  const section = document.getElementById('chartsSection');
+  try {
+    const res = await fetch(`/api/runs/${runId}/charts`);
+    const data = await res.json();
+    const charts = data.charts || {};
+    const nodeNames = Object.keys(charts);
+
+    if (nodeNames.length === 0) {
+      section.innerHTML = '<div class="placeholder" style="height:100px">No chart data</div>';
+      return;
+    }
+
+    section.innerHTML = '';
+    for (const nodeName of nodeNames) {
+      const div = document.createElement('div');
+      div.className = 'chart-container';
+      const plotDiv = document.createElement('div');
+      plotDiv.style.height = '350px';
+      div.appendChild(plotDiv);
+      section.appendChild(div);
+
+      const fig = charts[nodeName];
+      fig.layout.height = 350;
+      fig.layout.paper_bgcolor = 'white';
+      fig.layout.plot_bgcolor = 'white';
+      Plotly.newPlot(plotDiv, fig.data, fig.layout, {responsive: true, displayModeBar: true, modeBarButtonsToRemove: ['lasso2d','select2d']});
+    }
+  } catch(e) {
+    section.innerHTML = '<div class="placeholder" style="height:100px">Failed to load charts</div>';
+  }
+}
+
+async function toggleFold(runId, foldIdx) {
+  const body = document.getElementById(`fold-${runId}-${foldIdx}`);
+  if (body.classList.contains('open')) {
+    body.classList.remove('open');
+    return;
+  }
+  body.classList.add('open');
+  if (body.dataset.loaded) return;
+
+  body.innerHTML = 'Loading...';
+  const res = await fetch(`/api/runs/${runId}/fold/${foldIdx}`);
+  const data = await res.json();
+
+  // Build metrics as array-of-objects for buildMetricsTable
+  const metricNames = Object.keys(Object.values(data.metrics)[0] || {});
+  const rows = Object.entries(data.metrics).map(([nodeStr, mets]) => ({ node: nodeStr, ...mets }));
+  let html = buildMetricsTable(rows, metricNames);
+
+  // Per-node charts for this fold
+  for (const nodeName of Object.keys(data.series)) {
+    html += `<div class="chart-container"><div id="fold-chart-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}" style="height:300px"></div></div>`;
+  }
+
+  body.innerHTML = html;
+  body.dataset.loaded = '1';
+
+  // Render fold charts
+  const color = FOLD_COLORS[foldIdx % FOLD_COLORS.length];
+  const cutoff = data.cutoff;
+  const horizon = data.horizon;
+
+  for (const [nodeName, s] of Object.entries(data.series)) {
+    const divId = `fold-chart-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    const plotDiv = document.getElementById(divId);
+    if (!plotDiv) continue;
+
+    const traces = [];
+    const xFc = Array.from({length: horizon}, (_, i) => cutoff + i);
+
+    if (s.observed_full) {
+      traces.push({
+        x: Array.from({length: s.observed_full.length}, (_, i) => i),
+        y: s.observed_full,
+        mode: 'lines', name: 'Observed',
+        line: {color: 'black', width: 1.5},
+      });
+    }
+
+    if (s.actual) {
+      traces.push({
+        x: xFc, y: s.actual,
+        mode: 'lines+markers', name: 'Actual (test)',
+        line: {color: color, width: 1.5, dash: 'dot'},
+        marker: {size: 5},
+      });
+    }
+
+    if (s.forecast_median) {
+      traces.push({
+        x: xFc, y: s.forecast_median,
+        mode: 'lines', name: 'Median forecast',
+        line: {color: color, width: 2.5},
+      });
+    }
+
+    if (s.forecast_p75) {
+      traces.push({x: xFc, y: s.forecast_p75, mode: 'lines', name: '75th', line: {width: 0}, showlegend: false});
+      traces.push({x: xFc, y: s.forecast_p25, mode: 'lines', name: '25th', line: {width: 0}, fill: 'tonexty', fillcolor: color + '33', showlegend: false});
+    }
+
+    if (s.forecast_p95) {
+      traces.push({x: xFc, y: s.forecast_p95, mode: 'lines', name: '95th', line: {width: 0}, showlegend: false});
+      traces.push({x: xFc, y: s.forecast_p5, mode: 'lines', name: '5th', line: {width: 0}, fill: 'tonexty', fillcolor: color + '1a', showlegend: false});
+    }
+
+    const layout = {
+      title: {text: `${nodeName} — Fold ${foldIdx + 1}`, font: {size: 13}},
+      xaxis: {title: 'Time index'},
+      yaxis: {title: 'Value'},
+      margin: {l: 50, r: 20, t: 35, b: 40},
+      legend: {font: {size: 10}},
+      hovermode: 'x unified',
+      height: 300,
+      paper_bgcolor: 'white',
+      plot_bgcolor: 'white',
+      shapes: [{
+        type: 'line', x0: cutoff, x1: cutoff, y0: 0, y1: 1, yref: 'paper',
+        line: {color: color, dash: 'dash', width: 1},
+      }],
+    };
+
+    Plotly.newPlot(plotDiv, traces, layout, {responsive: true, displayModeBar: false});
+  }
+}
+
+function openModal() { document.getElementById('modalOverlay').classList.add('open'); }
+function closeModal() { document.getElementById('modalOverlay').classList.remove('open'); document.getElementById('progressArea').style.display = 'none'; }
+
+async function submitRun(e) {
+  e.preventDefault();
+  const form = document.getElementById('newRunForm');
+  const fd = new FormData(form);
+  const body = {};
+  for (const [k, v] of fd.entries()) {
+    body[k] = ['test_size','n_splits','num_warmup','num_samples','num_chains','rng_seed'].includes(k) ? parseInt(v) : v;
+  }
+
+  const res = await fetch('/api/runs', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const err = await res.json();
+    alert('Error: ' + (err.detail || JSON.stringify(err)));
+    return false;
+  }
+  const data = await res.json();
+  const runId = data.run_id;
+
+  const progressArea = document.getElementById('progressArea');
+  const progressFill = document.getElementById('progressFill');
+  const progressText = document.getElementById('progressText');
+  progressArea.style.display = 'block';
+  progressFill.style.width = '0%';
+  progressText.textContent = 'Starting...';
+
+  const evtSource = new EventSource(`/api/runs/${runId}/progress`);
+  evtSource.onmessage = function(event) {
+    const msg = JSON.parse(event.data);
+    if (msg.event === 'fold_start') {
+      const pct = (msg.fold / (msg.total || 1)) * 100;
+      progressFill.style.width = pct + '%';
+      progressText.textContent = `Running fold ${msg.fold + 1} of ${msg.total}...`;
+    } else if (msg.event === 'fold_done') {
+      const pct = ((msg.fold + 1) / (msg.total || body.n_splits || 1)) * 100;
+      progressFill.style.width = pct + '%';
+      progressText.textContent = `Fold ${msg.fold + 1} done`;
+    } else if (msg.event === 'complete') {
+      progressFill.style.width = '100%';
+      progressText.textContent = 'Complete!';
+      evtSource.close();
+      setTimeout(() => { closeModal(); loadRuns(); selectRun(runId); }, 1000);
+    } else if (msg.event === 'error') {
+      progressText.textContent = 'Error: ' + msg.message;
+      evtSource.close();
+    }
+  };
+
+  loadRuns();
+  return false;
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+loadRuns();
+</script>
+</body>
+</html>

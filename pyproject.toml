@@ -5,10 +5,13 @@ description = "Ergodic TS — tools for time-series forecasting"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "snowflake-connector-python",
-    "pandas",
+    "snowflake-connector-python[pandas]",
     "python-dotenv",
+    "pydantic>=2.0",
 ]
+
+[project.optional-dependencies]
+viz = ["graphviz"]
 
 [build-system]
 requires = ["hatchling"]
@@ -16,3 +19,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ergodicts"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "pytest>=8.0",
+]
+docs = [
+    "mkdocs-material",
+    "mkdocstrings[python]",
+]

@@ -2,7 +2,17 @@
 
 __version__ = "0.1.0"
 
-from ergodicts.snowflake_client import SnowflakeClient
+from ergodicts.snowflake_client import SnowflakeClient, TableExistsError
+from ergodicts.utils import date_to_quarter_string, quarter_string_to_date
+from ergodicts.reducer import (
+    ModelKey,
+    DependencyGraph,
+    ReducerConfig,
+    ReducerResult,
+    ReducerPipeline,
+    apply_reducer,
+    check_harmonization,
+)
 
 
 def snowflake_client(**kwargs) -> SnowflakeClient:

@@ -16,3 +16,8 @@ wheels/
 .claude/*
 .claude
 
+data/
+notebooks/
+
+# Docs build output
+site/

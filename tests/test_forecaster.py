@@ -129,12 +129,14 @@ class TestPrepareData:
         assert data.y[child_b].shape == (48,)
         assert data.y[parent].shape == (48,)
 
-    def test_standardized(self, hierarchy, tiny_dag, tiny_y, tiny_x, child_a):
+    def test_ratio_scaled(self, hierarchy, tiny_dag, tiny_y, tiny_x, child_a):
         data = prepare_data(hierarchy, tiny_dag, tiny_y, tiny_x)
-        y_std = np.asarray(data.y[child_a])
-        # Standardised values should have mean ~0 and std ~1
-        assert abs(np.mean(y_std)) < 0.2
-        assert abs(np.std(y_std) - 1.0) < 0.2
+        y_scaled = np.asarray(data.y[child_a])
+        # Ratio-scaled values should be centred around 1.0 (median ≈ 1)
+        assert np.median(y_scaled) > 0.5
+        assert np.median(y_scaled) < 2.0
+        # All values should be positive (sales data)
+        assert np.all(y_scaled > 0)
 
     def test_unstandardize_roundtrip(self, hierarchy, tiny_dag, tiny_y, tiny_x, child_a):
         data = prepare_data(hierarchy, tiny_dag, tiny_y, tiny_x)
@@ -212,6 +214,36 @@ class TestHierarchicalForecaster:
         model = HierarchicalForecaster(hierarchy, tiny_dag)
         with pytest.raises(RuntimeError, match="Must call .fit"):
             model.forecast(horizon=6)
+
+    def test_svi_inference(self, hierarchy, tiny_dag, tiny_y, tiny_x, child_a, child_b, parent):
+        """SVI inference produces forecasts with correct shapes."""
+        configs = {
+            parent: NodeConfig(mode="active", components=(LocalLinearTrend(), FourierSeasonality(n_harmonics=1))),
+            child_a: NodeConfig(mode="active", components=(LocalLinearTrend(), FourierSeasonality(n_harmonics=1))),
+            child_b: NodeConfig(mode="active", components=(LocalLinearTrend(), FourierSeasonality(n_harmonics=1))),
+        }
+        model = HierarchicalForecaster(
+            hierarchy=hierarchy,
+            causal_dag=tiny_dag,
+            node_configs=configs,
+            reconciliation="bottom_up",
+        )
+        model.fit(
+            y_data=tiny_y,
+            x_data=tiny_x,
+            inference="svi",
+            num_samples=10,
+            svi_steps=50,
+            svi_lr=0.01,
+            rng_seed=0,
+        )
+        assert model._samples is not None
+        forecasts = model.forecast(horizon=6)
+        assert child_a in forecasts
+        assert child_b in forecasts
+        assert parent in forecasts
+        assert forecasts[child_a].shape == (10, 6)
+        assert np.all(np.isfinite(forecasts[child_a]))
 
     def test_no_hierarchy(self, tiny_dag, child_a, child_b, rng, ext_x1):
         """Model works without hierarchy (independent nodes)."""

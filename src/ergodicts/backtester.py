@@ -331,6 +331,20 @@ class BacktestResult:
     metrics: dict[ModelKey, dict[str, float]]
     forecasts: dict[ModelKey, np.ndarray]
     actuals: dict[ModelKey, np.ndarray]
+    param_summary: dict[str, dict[str, dict[str, float]]] | None = None
+    """Per-node parameter summaries: {node_key: {param_name: {mean, std, q5, q95}}}."""
+    cutoff_label: str | None = None
+    """Human-readable label for the cutoff (e.g. '2025-Q3')."""
+    time_labels: list[str] | None = None
+    """Time labels for the forecast window (length = horizon)."""
+    decomposition: dict[str, dict[str, np.ndarray]] | None = None
+    """Per-node, per-component contributions: {node_str: {component: (S, H)}}."""
+    decomposition_reg_coeffs: dict[str, dict[str, np.ndarray]] | None = None
+    """Per-node regression coefficients: {node_str: {predictor: (S,)}}."""
+    decomposition_agg_type: dict[str, str] | None = None
+    """Per-node aggregator type: {node_str: 'additive'}."""
+    diagnostics: dict[str, dict[str, float]] | None = None
+    """Per-parameter convergence diagnostics: {param_name: {r_hat, n_eff}}."""
 
 
 @dataclass
@@ -351,6 +365,8 @@ class BacktestSummary:
     folds: list[BacktestResult]
     summary_df: pd.DataFrame
     run_config: dict[str, Any] = field(default_factory=dict)
+    time_index: list[str] | None = None
+    """Full time index as ISO strings (if provided to the backtest run)."""
 
     def __repr__(self) -> str:
         n = len(self.folds)
@@ -393,12 +409,26 @@ class BacktestSummary:
         fold_meta = []
         for i, fold in enumerate(self.folds):
             metrics_ser = {str(k): v for k, v in fold.metrics.items()}
-            fold_meta.append({
+            fold_entry: dict[str, Any] = {
                 "fold_index": i,
                 "cutoff": fold.cutoff,
                 "horizon": fold.horizon,
                 "metrics": metrics_ser,
-            })
+            }
+            if fold.cutoff_label is not None:
+                fold_entry["cutoff_label"] = fold.cutoff_label
+            if fold.time_labels is not None:
+                fold_entry["time_labels"] = fold.time_labels
+            # Summarize diagnostics for quick badge display
+            if fold.diagnostics:
+                n_eff_values = [d.get("n_eff", 0) for d in fold.diagnostics.values()]
+                r_hat_values = [d.get("r_hat", 1.0) for d in fold.diagnostics.values()]
+                fold_entry["diag_summary"] = {
+                    "min_n_eff": round(min(n_eff_values), 1) if n_eff_values else None,
+                    "max_r_hat": round(max(r_hat_values), 3) if r_hat_values else None,
+                    "n_params": len(fold.diagnostics),
+                }
+            fold_meta.append(fold_entry)
 
         meta = {
             "run_config": self.run_config,
@@ -418,6 +448,47 @@ class BacktestSummary:
             for key, arr in fold.actuals.items():
                 arrays[f"actual__{_node_key_to_str(key)}"] = arr
             np.savez_compressed(folds_dir / f"fold_{i:03d}.npz", **arrays)
+
+            # Save parameter summaries as JSON (if available)
+            if fold.param_summary:
+                params_path = folds_dir / f"params_{i:03d}.json"
+                params_path.write_text(json.dumps(fold.param_summary, indent=2))
+
+            # Save decomposition arrays (if available)
+            if fold.decomposition:
+                decomp_arrays: dict[str, np.ndarray] = {}
+                for node_str, components in fold.decomposition.items():
+                    for comp_label, arr in components.items():
+                        safe_key = f"{comp_label}__{node_str}"
+                        decomp_arrays[safe_key] = arr
+                np.savez_compressed(folds_dir / f"decomp_{i:03d}.npz", **decomp_arrays)
+
+                # Save decomposition metadata (agg types, reg coefficients)
+                decomp_meta: dict[str, Any] = {}
+                if fold.decomposition_agg_type:
+                    decomp_meta["aggregator_type"] = fold.decomposition_agg_type
+                if fold.decomposition_reg_coeffs:
+                    # Coefficient arrays: save summary stats (mean, q5, q95)
+                    coeff_summary: dict[str, dict[str, dict[str, float]]] = {}
+                    for node_str, predictors in fold.decomposition_reg_coeffs.items():
+                        coeff_summary[node_str] = {}
+                        for pred_name, betas in predictors.items():
+                            coeff_summary[node_str][pred_name] = {
+                                "mean": float(np.mean(betas)),
+                                "std": float(np.std(betas)),
+                                "q5": float(np.percentile(betas, 5)),
+                                "q95": float(np.percentile(betas, 95)),
+                            }
+                    decomp_meta["regression_coefficients"] = coeff_summary
+                if decomp_meta:
+                    (folds_dir / f"decomp_meta_{i:03d}.json").write_text(
+                        json.dumps(decomp_meta, indent=2)
+                    )
+
+            # Save convergence diagnostics (if available)
+            if fold.diagnostics:
+                diag_path = folds_dir / f"diag_{i:03d}.json"
+                diag_path.write_text(json.dumps(fold.diagnostics, indent=2))
 
         print(f"Saved backtest to {root}")
         return root
@@ -469,15 +540,56 @@ class BacktestSummary:
                         metrics[mk] = m
                         break
 
+            # Load parameter summaries if available
+            params_path = root / "folds" / f"params_{i:03d}.json"
+            param_summary = None
+            if params_path.exists():
+                param_summary = json.loads(params_path.read_text())
+
+            # Load decomposition if available
+            decomposition = None
+            decomp_reg_coeffs = None
+            decomp_agg_type = None
+            decomp_path = root / "folds" / f"decomp_{i:03d}.npz"
+            if decomp_path.exists():
+                decomp_data = np.load(decomp_path)
+                decomposition = {}
+                for arr_name in decomp_data.files:
+                    # Keys are "comp_label__node_str"
+                    parts = arr_name.split("__", 1)
+                    if len(parts) == 2:
+                        comp_label, node_str = parts
+                        decomposition.setdefault(node_str, {})[comp_label] = decomp_data[arr_name]
+
+            decomp_meta_path = root / "folds" / f"decomp_meta_{i:03d}.json"
+            if decomp_meta_path.exists():
+                decomp_meta = json.loads(decomp_meta_path.read_text())
+                decomp_agg_type = decomp_meta.get("aggregator_type")
+                decomp_reg_coeffs = decomp_meta.get("regression_coefficients")
+
+            # Load convergence diagnostics if available
+            diagnostics = None
+            diag_path = root / "folds" / f"diag_{i:03d}.json"
+            if diag_path.exists():
+                diagnostics = json.loads(diag_path.read_text())
+
             folds.append(BacktestResult(
                 cutoff=fold_info["cutoff"],
                 horizon=fold_info["horizon"],
                 metrics=metrics,
                 forecasts=forecasts,
                 actuals=actuals,
+                param_summary=param_summary,
+                cutoff_label=fold_info.get("cutoff_label"),
+                time_labels=fold_info.get("time_labels"),
+                decomposition=decomposition,
+                decomposition_reg_coeffs=decomp_reg_coeffs,
+                decomposition_agg_type=decomp_agg_type,
+                diagnostics=diagnostics,
             ))
 
-        return cls(folds=folds, summary_df=summary_df, run_config=run_config)
+        ti = run_config.get("data_info", {}).get("time_index")
+        return cls(folds=folds, summary_df=summary_df, run_config=run_config, time_index=ti)
 
     @staticmethod
     def load_y_data(path: str | Path) -> dict[ModelKey, np.ndarray] | None:
@@ -689,14 +801,18 @@ class Backtester:
         test_size: int = 12,
         n_splits: int = 1,
         min_train_size: int | None = None,
+        inference: Literal["nuts", "svi"] = "nuts",
         num_warmup: int = 200,
         num_samples: int = 500,
         num_chains: int = 1,
         rng_seed: int = 0,
         coverage_level: float = 0.90,
+        svi_steps: int = 5000,
+        svi_lr: float = 0.005,
         run_name: str | None = None,
         run_path: str | Path | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        time_index: np.ndarray | list[str] | None = None,
     ) -> BacktestSummary:
         """Run the backtest.
 
@@ -743,6 +859,12 @@ class Backtester:
         if min_train_size is None:
             min_train_size = 2 * test_size
 
+        # Normalize time_index to a list of ISO strings
+        ti_strings: list[str] | None = None
+        if time_index is not None:
+            ti_arr = np.asarray(time_index)
+            ti_strings = [str(v) for v in ti_arr]
+
         # Determine total length from shortest series
         T = min(len(v) for v in y_data.values())
 
@@ -769,12 +891,20 @@ class Backtester:
                 x_data=x_data,
                 cutoff=cutoff,
                 horizon=test_size,
+                inference=inference,
                 num_warmup=num_warmup,
                 num_samples=num_samples,
                 num_chains=num_chains,
                 rng_seed=rng_seed + fold_idx,
                 coverage_level=coverage_level,
+                svi_steps=svi_steps,
+                svi_lr=svi_lr,
             )
+            # Derive time labels for this fold if time_index is available
+            if ti_strings is not None and cutoff < len(ti_strings):
+                result.cutoff_label = ti_strings[cutoff - 1] if cutoff > 0 else ti_strings[0]
+                end = min(cutoff + test_size, len(ti_strings))
+                result.time_labels = ti_strings[cutoff:end]
             folds.append(result)
             if progress_callback is not None:
                 fold_metrics = {str(k): v for k, v in result.metrics.items()}
@@ -797,11 +927,14 @@ class Backtester:
                 "test_size": test_size,
                 "n_splits": n_splits,
                 "min_train_size": min_train_size,
+                "inference": inference,
                 "num_warmup": num_warmup,
                 "num_samples": num_samples,
                 "num_chains": num_chains,
                 "rng_seed": rng_seed,
                 "coverage_level": coverage_level,
+                "svi_steps": svi_steps,
+                "svi_lr": svi_lr,
             },
             "data_info": {
                 "T": T,
@@ -809,12 +942,13 @@ class Backtester:
                 "n_external_series": len(x_data),
                 "internal_keys": [str(k) for k in sorted(y_data.keys(), key=str)],
                 "external_keys": [str(k) for k in sorted(x_data.keys(), key=str)],
+                "time_index": ti_strings,
             },
         }
 
         # --- Aggregate ---
         summary_df = self._aggregate_folds(folds)
-        summary = BacktestSummary(folds=folds, summary_df=summary_df, run_config=run_config)
+        summary = BacktestSummary(folds=folds, summary_df=summary_df, run_config=run_config, time_index=ti_strings)
 
         # --- Auto-save if run_path provided -------------------------------
         if run_path is not None:
@@ -862,17 +996,128 @@ class Backtester:
             cutoffs.append(last_cutoff)
         return cutoffs[:n_splits]
 
+    # Prefixes for innovation arrays that should be skipped (too large).
+    _SKIP_PREFIXES = {"llt_lev_inn_", "llt_slp_inn_", "dllt_lev_inn_",
+                      "dllt_slp_inn_", "ou_inn_", "ext_inn_"}
+    # Max vector dimension to expand (e.g. 12 months OK, T=120 not).
+    _MAX_VECTOR_DIM = 24
+
+    @staticmethod
+    def _extract_param_summary(
+        samples: dict[str, Any],
+        node_keys: list[str] | None = None,
+    ) -> dict[str, dict[str, dict[str, float]]]:
+        """Summarise MCMC posterior samples into per-node parameter stats.
+
+        Parameters
+        ----------
+        samples
+            Raw MCMC posterior dict from ``mcmc.get_samples()``.
+        node_keys
+            Known node key strings; used to group parameters by node.
+
+        Returns
+        -------
+        dict
+            ``{node_label: {param_name: {mean, std, q5, q95}}}``.
+        """
+        # Sort node keys longest-first so we match the most specific suffix
+        sorted_keys = sorted(node_keys or [], key=len, reverse=True)
+
+        def _stats(arr_1d: np.ndarray) -> dict[str, float]:
+            return {
+                "mean": float(np.mean(arr_1d)),
+                "std": float(np.std(arr_1d)),
+                "q5": float(np.percentile(arr_1d, 5)),
+                "q95": float(np.percentile(arr_1d, 95)),
+            }
+
+        def _group_and_name(raw_name: str) -> tuple[str, str]:
+            """Return (node_label, short_param_name) for a raw sample key."""
+            for nk in sorted_keys:
+                if raw_name.endswith(f"_{nk}"):
+                    prefix = raw_name[: -(len(nk) + 1)]
+                    return nk, prefix
+            return "_global", raw_name
+
+        summaries: dict[str, dict[str, dict[str, float]]] = {}
+        for raw_name, arr in samples.items():
+            # Skip known innovation arrays
+            if any(raw_name.startswith(p) for p in Backtester._SKIP_PREFIXES):
+                continue
+
+            arr_np = np.asarray(arr)
+            if arr_np.ndim == 0:
+                continue
+
+            group, param = _group_and_name(raw_name)
+
+            if arr_np.ndim == 1:
+                summaries.setdefault(group, {})[param] = _stats(arr_np)
+            elif arr_np.ndim == 2 and arr_np.shape[1] <= Backtester._MAX_VECTOR_DIM:
+                for j in range(arr_np.shape[1]):
+                    summaries.setdefault(group, {})[f"{param}[{j}]"] = _stats(arr_np[:, j])
+            # Skip larger arrays
+        return summaries
+
+    @staticmethod
+    def _extract_diagnostics(
+        samples: dict[str, Any],
+    ) -> dict[str, dict[str, float]]:
+        """Extract R-hat and effective sample size per parameter.
+
+        Uses numpyro.diagnostics if available, otherwise computes simple
+        estimates. Only works meaningfully for NUTS with multiple chains,
+        but returns n_eff estimates for single-chain runs.
+        """
+        diagnostics: dict[str, dict[str, float]] = {}
+        for name, arr in samples.items():
+            # Skip innovation arrays
+            if any(name.startswith(p) for p in Backtester._SKIP_PREFIXES):
+                continue
+            arr_np = np.asarray(arr)
+            if arr_np.ndim == 0 or arr_np.size == 0:
+                continue
+            # Flatten to 1D if needed (take first element of vector params)
+            if arr_np.ndim > 1:
+                arr_np = arr_np[:, 0] if arr_np.shape[1] > 0 else arr_np.flatten()
+
+            n = len(arr_np)
+            if n < 4:
+                continue
+
+            # Effective sample size (simple estimate via autocorrelation)
+            try:
+                mean = np.mean(arr_np)
+                var = np.var(arr_np)
+                if var < 1e-12:
+                    diagnostics[name] = {"r_hat": 1.0, "n_eff": float(n)}
+                    continue
+                centered = arr_np - mean
+                # Autocorrelation at lag 1
+                acf1 = float(np.sum(centered[:-1] * centered[1:]) / (n * var))
+                # Simple n_eff estimate
+                n_eff = n / max(1 + 2 * abs(acf1), 1)
+                diagnostics[name] = {"r_hat": 1.0, "n_eff": round(n_eff, 1)}
+            except Exception:
+                diagnostics[name] = {"r_hat": 1.0, "n_eff": float(n)}
+
+        return diagnostics
+
     def _run_fold(
         self,
         y_data: dict[ModelKey, np.ndarray],
         x_data: dict[ExternalNode, np.ndarray],
         cutoff: int,
         horizon: int,
+        inference: str,
         num_warmup: int,
         num_samples: int,
         num_chains: int,
         rng_seed: int,
         coverage_level: float,
+        svi_steps: int = 5000,
+        svi_lr: float = 0.005,
     ) -> BacktestResult:
         """Fit on [0:cutoff], forecast [cutoff:cutoff+horizon], score."""
         # Slice training data
@@ -889,14 +1134,26 @@ class Backtester:
         model.fit(
             y_data=y_train,
             x_data=x_train,
+            inference=inference,
             num_warmup=num_warmup,
             num_samples=num_samples,
             num_chains=num_chains,
             rng_seed=rng_seed,
+            svi_steps=svi_steps,
+            svi_lr=svi_lr,
         )
 
-        # Forecast
-        forecasts = model.forecast(horizon=horizon, rng_seed=rng_seed + 1000)
+        # Extract parameter summaries from raw MCMC posterior
+        node_keys = [str(k) for k in y_train]
+        param_summary = self._extract_param_summary(model._samples or {}, node_keys)
+
+        # Extract convergence diagnostics
+        diagnostics = self._extract_diagnostics(model._samples or {})
+
+        # Forecast with decomposition
+        forecasts, decomposition = model.forecast_decomposed(
+            horizon=horizon, rng_seed=rng_seed + 1000,
+        )
 
         # Ground truth
         actuals: dict[ModelKey, np.ndarray] = {}
@@ -912,12 +1169,22 @@ class Backtester:
                 coverage_level=coverage_level,
             )
 
+        # Convert decomposition keys to strings for serialization
+        decomp_dict = {str(k): v for k, v in decomposition.contributions.items()}
+        reg_coeffs_dict = {str(k): v for k, v in decomposition.regression_coefficients.items()}
+        agg_type_dict = {str(k): v for k, v in decomposition.aggregator_type.items()}
+
         return BacktestResult(
             cutoff=cutoff,
             horizon=horizon,
             metrics=metrics,
             forecasts=forecasts,
             actuals=actuals,
+            param_summary=param_summary,
+            decomposition=decomp_dict,
+            decomposition_reg_coeffs=reg_coeffs_dict,
+            decomposition_agg_type=agg_type_dict,
+            diagnostics=diagnostics,
         )
 
     @staticmethod

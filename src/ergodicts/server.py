@@ -146,6 +146,9 @@ def create_app(runs_dir: Path) -> FastAPI:
         summary = BacktestSummary.load(run_path)
         y_data = BacktestSummary.load_y_data(run_path)
 
+        # Read time_index from meta if available
+        time_index: list[str] | None = summary.time_index
+
         colors = [
             "#2563eb", "#dc2626", "#16a34a", "#9333ea",
             "#ea580c", "#0891b2", "#ca8a04", "#db2777",
@@ -168,8 +171,9 @@ def create_app(runs_dir: Path) -> FastAPI:
             # Full observed series if y_data available
             if y_data is not None and node in y_data:
                 full_y = y_data[node]
+                x_obs = time_index[:len(full_y)] if time_index and len(time_index) >= len(full_y) else list(range(len(full_y)))
                 traces.append({
-                    "x": list(range(len(full_y))),
+                    "x": x_obs if isinstance(x_obs, list) else list(x_obs),
                     "y": full_y.tolist(),
                     "mode": "lines",
                     "name": "Observed",
@@ -186,7 +190,15 @@ def create_app(runs_dir: Path) -> FastAPI:
                 actual = fold.actuals.get(node)
                 cutoff = fold.cutoff
                 horizon = fold.horizon
-                x_fc = list(range(cutoff, cutoff + horizon))
+
+                # Use time labels if available, otherwise integer indices
+                if fold.time_labels:
+                    x_fc = fold.time_labels[:horizon]
+                elif time_index and cutoff + horizon <= len(time_index):
+                    x_fc = time_index[cutoff:cutoff + horizon]
+                else:
+                    x_fc = list(range(cutoff, cutoff + horizon))
+
                 color = colors[fi % len(colors)]
                 n_folds = len(summary.folds)
                 label = f"Fold {fi + 1}" if n_folds > 1 else "Forecast"
@@ -235,23 +247,34 @@ def create_app(runs_dir: Path) -> FastAPI:
 
                 # Cutoff line via shapes (added in layout)
 
+            # Determine cutoff x-values for shapes
+            shapes = []
+            for fi, fold in enumerate(summary.folds):
+                if node not in fold.forecasts:
+                    continue
+                if fold.cutoff_label:
+                    cutoff_x = fold.cutoff_label
+                elif time_index and fold.cutoff < len(time_index):
+                    cutoff_x = time_index[fold.cutoff]
+                else:
+                    cutoff_x = fold.cutoff
+                shapes.append({
+                    "type": "line",
+                    "x0": cutoff_x, "x1": cutoff_x,
+                    "y0": 0, "y1": 1,
+                    "yref": "paper",
+                    "line": {"color": colors[fi % len(colors)], "dash": "dash", "width": 1},
+                })
+
+            x_title = "Date" if time_index else "Time index"
             layout = {
                 "title": {"text": node_label, "font": {"size": 14}},
-                "xaxis": {"title": "Time index"},
+                "xaxis": {"title": x_title},
                 "yaxis": {"title": "Value"},
                 "margin": {"l": 50, "r": 20, "t": 40, "b": 40},
                 "legend": {"font": {"size": 11}},
                 "hovermode": "x unified",
-                "shapes": [
-                    {
-                        "type": "line",
-                        "x0": fold.cutoff, "x1": fold.cutoff,
-                        "y0": 0, "y1": 1,
-                        "yref": "paper",
-                        "line": {"color": colors[fi % len(colors)], "dash": "dash", "width": 1},
-                    }
-                    for fi, fold in enumerate(summary.folds) if node in fold.forecasts
-                ],
+                "shapes": shapes,
             }
 
             charts[node_label] = {"data": traces, "layout": layout}
@@ -277,6 +300,15 @@ def create_app(runs_dir: Path) -> FastAPI:
             "metrics": fold_info["metrics"],
             "series": {},
         }
+        # Include time labels if available
+        if fold_info.get("cutoff_label"):
+            result["cutoff_label"] = fold_info["cutoff_label"]
+        if fold_info.get("time_labels"):
+            result["time_labels"] = fold_info["time_labels"]
+        # Include full time_index if available
+        ti = meta.get("run_config", {}).get("data_info", {}).get("time_index")
+        if ti:
+            result["time_index"] = ti
 
         # Load y_data if available (for full observed series context)
         y_data = BacktestSummary.load_y_data(run_path)
@@ -302,6 +334,181 @@ def create_app(runs_dir: Path) -> FastAPI:
                     if str(nk) == node_label:
                         result["series"][node_label]["observed_full"] = y_data[nk].tolist()
                         break
+
+        # Load parameter summaries if available
+        params_path = run_path / "folds" / f"params_{fold_idx:03d}.json"
+        if params_path.exists():
+            result["param_summary"] = json.loads(params_path.read_text())
+
+        # Load convergence diagnostics if available
+        diag_path = run_path / "folds" / f"diag_{fold_idx:03d}.json"
+        if diag_path.exists():
+            result["diagnostics"] = json.loads(diag_path.read_text())
+
+        return result
+
+    @app.get("/api/compare")
+    async def compare_runs(run_a: str, run_b: str) -> dict[str, Any]:
+        """Compare two runs side-by-side with per-metric deltas."""
+        import pandas as pd
+
+        path_a = _get_run_dir(run_a)
+        path_b = _get_run_dir(run_b)
+
+        df_a = pd.read_csv(path_a / "summary.csv", index_col="node")
+        df_b = pd.read_csv(path_b / "summary.csv", index_col="node")
+
+        meta_a = json.loads((path_a / "meta.json").read_text())
+        meta_b = json.loads((path_b / "meta.json").read_text())
+
+        cfg_a = meta_a.get("run_config", {})
+        cfg_b = meta_b.get("run_config", {})
+
+        # Find common nodes and metrics
+        common_nodes = sorted(set(df_a.index) & set(df_b.index))
+        common_metrics = sorted(set(df_a.columns) & set(df_b.columns))
+
+        rows = []
+        for node in common_nodes:
+            row: dict[str, Any] = {"node": node}
+            for metric in common_metrics:
+                val_a = float(df_a.loc[node, metric]) if node in df_a.index else None
+                val_b = float(df_b.loc[node, metric]) if node in df_b.index else None
+                row[f"{metric}_a"] = val_a
+                row[f"{metric}_b"] = val_b
+                if val_a is not None and val_b is not None:
+                    row[f"{metric}_delta"] = val_b - val_a
+                else:
+                    row[f"{metric}_delta"] = None
+            rows.append(row)
+
+        return {
+            "run_a": {"id": run_a, "name": cfg_a.get("run_name", run_a)},
+            "run_b": {"id": run_b, "name": cfg_b.get("run_name", run_b)},
+            "metrics": common_metrics,
+            "rows": rows,
+        }
+
+    @app.get("/api/runs/{run_id}/fold/{fold_idx}/param-cards")
+    async def get_param_cards(run_id: str, fold_idx: int) -> dict[str, Any]:
+        """Return structured parameter cards for each node's components."""
+        from ergodicts.causal_dag import NodeConfig
+        from ergodicts.components import (
+            ExternalRegression,
+            RegressionComponent,
+            SeasonalityComponent,
+            TrendComponent,
+            resolve_components,
+        )
+        from ergodicts.reducer import ModelKey
+
+        run_path = _get_run_dir(run_id)
+        meta = json.loads((run_path / "meta.json").read_text())
+
+        if fold_idx < 0 or fold_idx >= meta["n_folds"]:
+            raise HTTPException(status_code=404, detail=f"Fold {fold_idx} not found")
+
+        # Load parameter summary for this fold
+        params_path = run_path / "folds" / f"params_{fold_idx:03d}.json"
+        if not params_path.exists():
+            return {"nodes": {}}
+
+        param_summary = json.loads(params_path.read_text())
+        cfg = meta.get("run_config", {})
+
+        # Try to reconstruct node configs for describe_params
+        try:
+            summary = BacktestSummary.load(run_path)
+            repro = summary.reproduce_config()
+            node_configs = repro.get("node_configs", {})
+            hierarchy = repro.get("hierarchy")
+            dag = repro.get("causal_dag")
+        except Exception:
+            return {"nodes": {}, "param_summary": param_summary}
+
+        # Build a fake samples dict from param_summary for describe_params
+        # (This is approximate — uses mean values only, not full posterior)
+        fake_samples: dict[str, Any] = {}
+        for node_str, params in param_summary.items():
+            for param_name, stats in params.items():
+                full_key = f"{param_name}_{node_str}" if node_str != "_global" else param_name
+                # Create a 1D array with the mean (describe_params uses extract_posterior)
+                fake_samples[full_key] = np.array([stats["mean"]])
+
+        result_nodes: dict[str, list[dict[str, Any]]] = {}
+        for mk, ncfg in node_configs.items():
+            node_str = str(mk)
+            components = resolve_components(ncfg)
+            cards_list = []
+            for comp in components:
+                try:
+                    if isinstance(comp, TrendComponent):
+                        desc = comp.describe_params(node_str, fake_samples)
+                    elif isinstance(comp, SeasonalityComponent):
+                        desc = comp.describe_params(node_str, fake_samples)
+                    elif isinstance(comp, RegressionComponent):
+                        # Get predictor names from DAG
+                        pred_names = None
+                        if dag:
+                            edges = dag.parents_of(mk)
+                            from ergodicts.causal_dag import ExternalNode as EN
+                            pred_names = [e.source.name if isinstance(e.source, EN) else str(e.source) for e in edges]
+                        desc = comp.describe_params(node_str, fake_samples, predictor_names=pred_names)
+                    else:
+                        desc = {"type": "unknown", "display_name": "Unknown", "cards": []}
+                    cards_list.append(desc)
+                except Exception:
+                    cards_list.append({"type": comp.component_name, "display_name": comp.component_name, "cards": [], "error": "Failed to describe"})
+
+            if cards_list:
+                result_nodes[node_str] = cards_list
+
+        return {"nodes": result_nodes}
+
+    @app.get("/api/runs/{run_id}/fold/{fold_idx}/decomposition")
+    async def get_decomposition(run_id: str, fold_idx: int) -> dict[str, Any]:
+        """Return per-node, per-component decomposition for a fold."""
+        run_path = _get_run_dir(run_id)
+        meta = json.loads((run_path / "meta.json").read_text())
+
+        if fold_idx < 0 or fold_idx >= meta["n_folds"]:
+            raise HTTPException(status_code=404, detail=f"Fold {fold_idx} not found")
+
+        decomp_path = run_path / "folds" / f"decomp_{fold_idx:03d}.npz"
+        if not decomp_path.exists():
+            raise HTTPException(status_code=404, detail="No decomposition data for this fold")
+
+        decomp_data = np.load(decomp_path)
+        nodes: dict[str, dict[str, Any]] = {}
+        for arr_name in decomp_data.files:
+            parts = arr_name.split("__", 1)
+            if len(parts) != 2:
+                continue
+            comp_label, node_str = parts
+            arr = decomp_data[arr_name]
+            # Compute summary stats: median, p5, p95 across samples
+            median = np.median(arr, axis=0).tolist()
+            p5 = np.percentile(arr, 5, axis=0).tolist()
+            p95 = np.percentile(arr, 95, axis=0).tolist()
+            nodes.setdefault(node_str, {})[comp_label] = {
+                "median": median, "p5": p5, "p95": p95,
+            }
+
+        # Load metadata (aggregator types + regression coefficients)
+        result: dict[str, Any] = {"nodes": nodes}
+        decomp_meta_path = run_path / "folds" / f"decomp_meta_{fold_idx:03d}.json"
+        if decomp_meta_path.exists():
+            decomp_meta = json.loads(decomp_meta_path.read_text())
+            result["aggregator_type"] = decomp_meta.get("aggregator_type", {})
+            result["regression_coefficients"] = decomp_meta.get("regression_coefficients", {})
+        else:
+            result["aggregator_type"] = {}
+            result["regression_coefficients"] = {}
+
+        # Include time labels if available
+        fold_info = meta["folds"][fold_idx]
+        if fold_info.get("time_labels"):
+            result["time_labels"] = fold_info["time_labels"]
 
         return result
 

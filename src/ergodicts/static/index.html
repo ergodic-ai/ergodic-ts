@@ -153,6 +153,18 @@
   .param-card.help-link:hover { border-color: var(--accent); }
   .node-configs-table th.help-link { cursor: pointer; border-bottom: 1.5px dashed #94a3b8; }
   .node-configs-table th.help-link:hover { color: var(--accent); }
+
+  /* Diagnostic badges */
+  .diag-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-left: 8px; }
+  .diag-green { background: #d1fae5; color: #065f46; }
+  .diag-yellow { background: #fef3c7; color: #92400e; }
+  .diag-red { background: #fecaca; color: #991b1b; }
+
+  /* Comparison layout */
+  .compare-section { margin: 20px 0; }
+  .compare-table td.delta-good { background: rgba(34,197,94,0.12); }
+  .compare-table td.delta-bad { background: rgba(239,68,68,0.12); }
+  .compare-table td.delta-neutral { background: rgba(234,179,8,0.08); }
 </style>
 </head>
 <body>
@@ -160,7 +172,10 @@
 <div class="sidebar">
   <div class="sidebar-header">
     <h2>Backtest Runs</h2>
-    <button class="btn btn-primary" onclick="openModal()">+ New Run</button>
+    <div style="display:flex;gap:4px">
+      <button class="btn" onclick="openCompareMode()" title="Compare two runs">Compare</button>
+      <button class="btn btn-primary" onclick="openModal()">+ New Run</button>
+    </div>
   </div>
   <div class="run-list" id="runList"></div>
   <div class="sidebar-footer">
@@ -837,6 +852,152 @@ function buildMetricsTable(rows, cols) {
 }
 
 // ---------------------------------------------------------------------------
+// Parameter summary table (per-fold trained model parameters)
+// ---------------------------------------------------------------------------
+
+function buildParamSummaryTable(paramSummary) {
+  // paramSummary: { node_key: { param_name: {mean, std, q5, q95}, ... }, ... }
+  const groups = Object.entries(paramSummary);
+  if (groups.length === 0) return '';
+
+  const fmtVal = (v) => {
+    if (v == null) return '';
+    const abs = Math.abs(v);
+    if (abs >= 1000) return v.toLocaleString(undefined, {maximumFractionDigits: 1});
+    if (abs >= 1) return v.toFixed(3);
+    if (abs >= 0.001) return v.toFixed(4);
+    return v.toExponential(2);
+  };
+
+  let html = '<div class="section-title" style="margin-top:16px">Trained Parameters</div>';
+
+  for (const [nodeKey, params] of groups) {
+    const entries = Object.entries(params);
+    if (entries.length === 0) continue;
+
+    const label = nodeKey === '_global' ? 'Global' : nodeKey;
+    html += `<details style="margin-bottom:8px"><summary style="cursor:pointer;font-weight:600;font-size:13px;padding:4px 0">${esc(label)} (${entries.length} params)</summary>`;
+    html += '<div class="metrics-wrap"><table class="metrics-table"><thead><tr>';
+    html += '<th>Parameter</th><th>Mean</th><th>Std</th><th>5th %ile</th><th>95th %ile</th>';
+    html += '</tr></thead><tbody>';
+
+    for (const [name, stats] of entries) {
+      html += `<tr>`;
+      html += `<td><code>${esc(name)}</code></td>`;
+      html += `<td>${fmtVal(stats.mean)}</td>`;
+      html += `<td>${fmtVal(stats.std)}</td>`;
+      html += `<td>${fmtVal(stats.q5)}</td>`;
+      html += `<td>${fmtVal(stats.q95)}</td>`;
+      html += `</tr>`;
+    }
+
+    html += '</tbody></table></div></details>';
+  }
+
+  return html;
+}
+
+function buildParamCards(paramCards) {
+  // paramCards: { nodes: { node_key: [ {type, display_name, cards: [{label, value, detail}], sparkline?, coefficient_chart?} ] } }
+  if (!paramCards || !paramCards.nodes) return '';
+  const nodes = Object.entries(paramCards.nodes);
+  if (nodes.length === 0) return '';
+
+  let html = '<div class="section-title" style="margin-top:16px">Component Parameters</div>';
+
+  for (const [nodeKey, components] of nodes) {
+    html += `<details style="margin-bottom:12px" open><summary style="cursor:pointer;font-weight:600;font-size:13px;padding:4px 0">${esc(nodeKey)}</summary>`;
+
+    for (const comp of components) {
+      html += `<div style="margin:8px 0 12px 0;padding:10px 14px;background:#f8fafc;border:1px solid var(--border);border-radius:6px">`;
+      html += `<div style="font-weight:600;font-size:12px;color:var(--accent);margin-bottom:6px">${esc(comp.display_name || comp.type)}</div>`;
+
+      // Cards grid
+      if (comp.cards && comp.cards.length > 0) {
+        html += '<div class="params-grid">';
+        for (const card of comp.cards) {
+          html += `<div class="param-card">`;
+          html += `<div class="label">${esc(card.label)}</div>`;
+          html += `<div class="value">${esc(card.value)}</div>`;
+          if (card.detail) {
+            html += `<div style="font-size:10px;color:var(--muted);margin-top:2px">${esc(card.detail)}</div>`;
+          }
+          html += `</div>`;
+        }
+        html += '</div>';
+      }
+
+      // Sparkline placeholder for seasonality
+      if (comp.sparkline && comp.sparkline.length > 0) {
+        const sparkId = `sparkline-${nodeKey}-${comp.type}`.replace(/[^a-zA-Z0-9]/g, '_');
+        html += `<div id="${sparkId}" style="height:120px;margin-top:8px"></div>`;
+      }
+
+      // Coefficient chart placeholder
+      if (comp.coefficient_chart && comp.coefficient_chart.length > 0) {
+        const coeffId = `paramcoeff-${nodeKey}-${comp.type}`.replace(/[^a-zA-Z0-9]/g, '_');
+        html += `<div id="${coeffId}" style="height:180px;margin-top:8px"></div>`;
+      }
+
+      if (comp.error) {
+        html += `<div style="color:#dc2626;font-size:11px;margin-top:4px">${esc(comp.error)}</div>`;
+      }
+      html += '</div>';
+    }
+    html += '</details>';
+  }
+  return html;
+}
+
+function renderParamCardCharts(paramCards) {
+  if (!paramCards || !paramCards.nodes) return;
+  for (const [nodeKey, components] of Object.entries(paramCards.nodes)) {
+    for (const comp of components) {
+      // Render sparkline for seasonality
+      if (comp.sparkline && comp.sparkline.length > 0) {
+        const sparkId = `sparkline-${nodeKey}-${comp.type}`.replace(/[^a-zA-Z0-9]/g, '_');
+        const el = document.getElementById(sparkId);
+        if (el) {
+          const labels = comp.sparkline.map((_, i) => i + 1);
+          Plotly.newPlot(el, [{
+            x: labels, y: comp.sparkline, type: 'bar',
+            marker: {color: comp.sparkline.map(v => v >= 0 ? '#3b82f6' : '#ef4444')},
+          }], {
+            title: {text: 'Seasonal Pattern (one period)', font: {size: 11}},
+            xaxis: {title: 'Period slot', dtick: 1},
+            yaxis: {title: 'Effect', zeroline: true, zerolinecolor: '#999'},
+            margin: {l: 50, r: 10, t: 30, b: 30},
+            height: 120, paper_bgcolor: '#f8fafc', plot_bgcolor: '#f8fafc',
+          }, {responsive: true, displayModeBar: false});
+        }
+      }
+      // Render coefficient chart
+      if (comp.coefficient_chart && comp.coefficient_chart.length > 0) {
+        const coeffId = `paramcoeff-${nodeKey}-${comp.type}`.replace(/[^a-zA-Z0-9]/g, '_');
+        const el = document.getElementById(coeffId);
+        if (el) {
+          const names = comp.coefficient_chart.map(c => c.name);
+          const means = comp.coefficient_chart.map(c => c.mean);
+          const errHi = comp.coefficient_chart.map(c => c.q95 - c.mean);
+          const errLo = comp.coefficient_chart.map(c => c.mean - c.q5);
+          Plotly.newPlot(el, [{
+            y: names, x: means, type: 'bar', orientation: 'h',
+            error_x: {type: 'data', symmetric: false, array: errHi, arrayminus: errLo, color: '#666'},
+            marker: {color: means.map(m => m >= 0 ? '#3b82f6' : '#ef4444')},
+          }], {
+            title: {text: 'Regression Coefficients (90% CI)', font: {size: 11}},
+            xaxis: {zeroline: true, zerolinecolor: '#999'},
+            yaxis: {automargin: true},
+            margin: {l: 100, r: 10, t: 30, b: 30},
+            height: 180, paper_bgcolor: '#f8fafc', plot_bgcolor: '#f8fafc',
+          }, {responsive: true, displayModeBar: false});
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Run config section
 // ---------------------------------------------------------------------------
 
@@ -918,6 +1079,11 @@ function buildConfigSection(cfg) {
     ['External series', info.n_external_series || 0],
     ['Elapsed', (cfg.elapsed_seconds || 0).toFixed(1) + 's'],
   ];
+  // Add time range if time_index is available
+  const ti = info.time_index;
+  if (ti && ti.length > 0) {
+    params.push(['Time range', `${ti[0]} → ${ti[ti.length - 1]}`]);
+  }
   html += '<div class="params-grid">';
   params.forEach(([label, value]) => {
     const hk = helpKeyFor(label);
@@ -1239,14 +1405,17 @@ async function loadRuns() {
   list.innerHTML = '';
   runs.forEach(run => {
     const div = document.createElement('div');
-    div.className = 'run-item' + (run.id === selectedRunId ? ' active' : '');
+    const isSelected = compareMode ? compareSelections.includes(run.id) : run.id === selectedRunId;
+    div.className = 'run-item' + (isSelected ? ' active' : '');
     const status = run.status || 'completed';
     const badgeClass = status === 'running' ? 'badge-running' : status === 'failed' ? 'badge-failed' : 'badge-completed';
+    const compareIndicator = compareMode && compareSelections.includes(run.id) ?
+      `<span class="badge badge-running">${compareSelections.indexOf(run.id) === 0 ? 'A' : 'B'}</span> ` : '';
     div.innerHTML = `
-      <div class="name">${esc(run.run_name)} <span class="badge ${badgeClass}">${status}</span></div>
+      <div class="name">${compareIndicator}${esc(run.run_name)} <span class="badge ${badgeClass}">${status}</span></div>
       <div class="meta">${run.timestamp ? run.timestamp.replace('T', ' ') : 'in progress'} &middot; ${run.n_folds} folds &middot; ${run.n_series} series</div>
     `;
-    div.onclick = () => selectRun(run.id);
+    div.onclick = () => compareMode ? selectForCompare(run.id) : selectRun(run.id);
     list.appendChild(div);
   });
 }
@@ -1305,9 +1474,24 @@ async function selectRun(runId) {
   html += '<div class="section-title">Fold Details</div>';
   for (let i = 0; i < data.n_folds; i++) {
     const foldMeta = data.folds[i];
+    const cutoffDisplay = foldMeta.cutoff_label || foldMeta.cutoff;
+    let diagBadge = '';
+    if (foldMeta.diag_summary) {
+      const ds = foldMeta.diag_summary;
+      const minEff = ds.min_n_eff;
+      const maxRhat = ds.max_r_hat;
+      let cls = 'diag-green';
+      let label = 'OK';
+      if (maxRhat > 1.1 || (minEff !== null && minEff < 100)) {
+        cls = 'diag-red'; label = 'Warning';
+      } else if (maxRhat > 1.05 || (minEff !== null && minEff < 400)) {
+        cls = 'diag-yellow'; label = 'Check';
+      }
+      diagBadge = `<span class="diag-badge ${cls}" title="min(n_eff)=${minEff}, max(R̂)=${maxRhat}">${label}</span>`;
+    }
     html += `
       <div class="fold-header" onclick="toggleFold('${runId}', ${i})">
-        Fold ${i + 1} &mdash; cutoff=${foldMeta.cutoff}, horizon=${foldMeta.horizon}
+        Fold ${i + 1} &mdash; cutoff=${esc(String(cutoffDisplay))}, horizon=${foldMeta.horizon} ${diagBadge}
       </div>
       <div class="fold-body" id="fold-${runId}-${i}"></div>
     `;
@@ -1371,9 +1555,26 @@ async function toggleFold(runId, foldIdx) {
   const rows = Object.entries(data.metrics).map(([nodeStr, mets]) => ({ node: nodeStr, ...mets }));
   let html = buildMetricsTable(rows, metricNames);
 
+  // Parameter cards placeholder (loaded async below)
+  html += `<div id="param-cards-${runId}-${foldIdx}"></div>`;
+
+  // Fallback: raw parameter summary table (if available)
+  if (data.param_summary) {
+    html += buildParamSummaryTable(data.param_summary);
+  }
+
+  // Convergence diagnostics table
+  if (data.diagnostics) {
+    html += buildDiagnosticsTable(data.diagnostics);
+  }
+
   // Per-node charts for this fold
   for (const nodeName of Object.keys(data.series)) {
     html += `<div class="chart-container"><div id="fold-chart-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}" style="height:300px"></div></div>`;
+    // Decomposition chart placeholder
+    html += `<div class="chart-container" id="decomp-wrap-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}" style="display:none"><div id="decomp-chart-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}" style="height:300px"></div></div>`;
+    // Coefficient chart placeholder
+    html += `<div class="chart-container" id="coeff-wrap-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}" style="display:none"><div id="coeff-chart-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}" style="height:250px"></div></div>`;
   }
 
   body.innerHTML = html;
@@ -1383,6 +1584,8 @@ async function toggleFold(runId, foldIdx) {
   const color = FOLD_COLORS[foldIdx % FOLD_COLORS.length];
   const cutoff = data.cutoff;
   const horizon = data.horizon;
+  const timeIndex = data.time_index || null;
+  const timeLabels = data.time_labels || null;
 
   for (const [nodeName, s] of Object.entries(data.series)) {
     const divId = `fold-chart-${runId}-${foldIdx}-${nodeName.replace(/[^a-zA-Z0-9]/g, '_')}`;
@@ -1390,12 +1593,27 @@ async function toggleFold(runId, foldIdx) {
     if (!plotDiv) continue;
 
     const traces = [];
-    const xFc = Array.from({length: horizon}, (_, i) => cutoff + i);
 
+    // Forecast x-axis: use time labels if available
+    let xFc;
+    if (timeLabels && timeLabels.length >= horizon) {
+      xFc = timeLabels.slice(0, horizon);
+    } else if (timeIndex && cutoff + horizon <= timeIndex.length) {
+      xFc = timeIndex.slice(cutoff, cutoff + horizon);
+    } else {
+      xFc = Array.from({length: horizon}, (_, i) => cutoff + i);
+    }
+
+    // Observed full series x-axis
     if (s.observed_full) {
+      let xObs;
+      if (timeIndex && timeIndex.length >= s.observed_full.length) {
+        xObs = timeIndex.slice(0, s.observed_full.length);
+      } else {
+        xObs = Array.from({length: s.observed_full.length}, (_, i) => i);
+      }
       traces.push({
-        x: Array.from({length: s.observed_full.length}, (_, i) => i),
-        y: s.observed_full,
+        x: xObs, y: s.observed_full,
         mode: 'lines', name: 'Observed',
         line: {color: 'black', width: 1.5},
       });
@@ -1428,9 +1646,20 @@ async function toggleFold(runId, foldIdx) {
       traces.push({x: xFc, y: s.forecast_p5, mode: 'lines', name: '5th', line: {width: 0}, fill: 'tonexty', fillcolor: color + '1a', showlegend: false});
     }
 
+    // Cutoff line: use time label or index
+    let cutoffX;
+    if (data.cutoff_label) {
+      cutoffX = data.cutoff_label;
+    } else if (timeIndex && cutoff < timeIndex.length) {
+      cutoffX = timeIndex[cutoff];
+    } else {
+      cutoffX = cutoff;
+    }
+
+    const xTitle = timeIndex ? 'Date' : 'Time index';
     const layout = {
       title: {text: `${nodeName} — Fold ${foldIdx + 1}`, font: {size: 13}},
-      xaxis: {title: 'Time index'},
+      xaxis: {title: xTitle},
       yaxis: {title: 'Value'},
       margin: {l: 50, r: 20, t: 35, b: 40},
       legend: {font: {size: 10}},
@@ -1439,12 +1668,178 @@ async function toggleFold(runId, foldIdx) {
       paper_bgcolor: 'white',
       plot_bgcolor: 'white',
       shapes: [{
-        type: 'line', x0: cutoff, x1: cutoff, y0: 0, y1: 1, yref: 'paper',
+        type: 'line', x0: cutoffX, x1: cutoffX, y0: 0, y1: 1, yref: 'paper',
         line: {color: color, dash: 'dash', width: 1},
       }],
     };
 
     Plotly.newPlot(plotDiv, traces, layout, {responsive: true, displayModeBar: false});
+  }
+
+  // Load decomposition data
+  loadDecomposition(runId, foldIdx, data);
+
+  // Load param cards
+  loadParamCards(runId, foldIdx);
+}
+
+function buildDiagnosticsTable(diagnostics) {
+  const entries = Object.entries(diagnostics);
+  if (entries.length === 0) return '';
+
+  let html = '<details style="margin-top:16px;margin-bottom:8px"><summary style="cursor:pointer;font-weight:600;font-size:13px;padding:4px 0">Convergence Diagnostics (' + entries.length + ' params)</summary>';
+  html += '<div class="metrics-wrap"><table class="metrics-table"><thead><tr>';
+  html += '<th>Parameter</th><th>R̂</th><th>n_eff</th><th>Status</th>';
+  html += '</tr></thead><tbody>';
+
+  for (const [name, stats] of entries) {
+    const rhat = stats.r_hat;
+    const neff = stats.n_eff;
+    let statusCls = 'diag-green';
+    let statusLabel = 'OK';
+    if (rhat > 1.1 || neff < 100) { statusCls = 'diag-red'; statusLabel = 'Warning'; }
+    else if (rhat > 1.05 || neff < 400) { statusCls = 'diag-yellow'; statusLabel = 'Check'; }
+
+    html += `<tr>`;
+    html += `<td><code>${esc(name)}</code></td>`;
+    html += `<td>${rhat != null ? rhat.toFixed(3) : '—'}</td>`;
+    html += `<td>${neff != null ? neff.toFixed(0) : '—'}</td>`;
+    html += `<td><span class="diag-badge ${statusCls}">${statusLabel}</span></td>`;
+    html += `</tr>`;
+  }
+
+  html += '</tbody></table></div></details>';
+  return html;
+}
+
+async function loadParamCards(runId, foldIdx) {
+  try {
+    const res = await fetch(`/api/runs/${runId}/fold/${foldIdx}/param-cards`);
+    if (!res.ok) return;
+    const paramCards = await res.json();
+    const container = document.getElementById(`param-cards-${runId}-${foldIdx}`);
+    if (!container) return;
+    const html = buildParamCards(paramCards);
+    if (html) {
+      container.innerHTML = html;
+      renderParamCardCharts(paramCards);
+    }
+  } catch(e) {
+    // Param cards not available — silently skip
+  }
+}
+
+const DECOMP_COLORS = ['#3b82f6','#ef4444','#22c55e','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#84cc16'];
+
+async function loadDecomposition(runId, foldIdx, foldData) {
+  try {
+    const res = await fetch(`/api/runs/${runId}/fold/${foldIdx}/decomposition`);
+    if (!res.ok) return;
+    const decomp = await res.json();
+    const nodes = decomp.nodes || {};
+    const aggTypes = decomp.aggregator_type || {};
+    const regCoeffs = decomp.regression_coefficients || {};
+    const timeLabels = decomp.time_labels || foldData.time_labels || null;
+    const timeIndex = foldData.time_index || null;
+    const cutoff = foldData.cutoff;
+
+    for (const [nodeName, components] of Object.entries(nodes)) {
+      const safeNode = nodeName.replace(/[^a-zA-Z0-9]/g, '_');
+      const wrapId = `decomp-wrap-${runId}-${foldIdx}-${safeNode}`;
+      const chartId = `decomp-chart-${runId}-${foldIdx}-${safeNode}`;
+      const wrap = document.getElementById(wrapId);
+      const plotDiv = document.getElementById(chartId);
+      if (!wrap || !plotDiv) continue;
+
+      const compNames = Object.keys(components);
+      if (compNames.length === 0) continue;
+
+      wrap.style.display = 'block';
+
+      // Build x-axis
+      const horizon = components[compNames[0]].median.length;
+      let xAxis;
+      if (timeLabels && timeLabels.length >= horizon) {
+        xAxis = timeLabels.slice(0, horizon);
+      } else if (timeIndex && cutoff + horizon <= timeIndex.length) {
+        xAxis = timeIndex.slice(cutoff, cutoff + horizon);
+      } else {
+        xAxis = Array.from({length: horizon}, (_, i) => cutoff + i);
+      }
+
+      const aggType = aggTypes[nodeName] || 'additive';
+      const traces = [];
+
+      if (aggType === 'additive' || aggType === 'log_additive') {
+        // Stacked area chart
+        compNames.forEach((compLabel, ci) => {
+          const comp = components[compLabel];
+          traces.push({
+            x: xAxis, y: comp.median,
+            name: compLabel.replace(/_/g, ' '),
+            stackgroup: 'one',
+            line: {width: 0.5, color: DECOMP_COLORS[ci % DECOMP_COLORS.length]},
+            fillcolor: DECOMP_COLORS[ci % DECOMP_COLORS.length] + '66',
+          });
+        });
+      } else {
+        // For multiplicative: show each component as separate lines
+        compNames.forEach((compLabel, ci) => {
+          const comp = components[compLabel];
+          const color = DECOMP_COLORS[ci % DECOMP_COLORS.length];
+          traces.push({
+            x: xAxis, y: comp.median,
+            name: compLabel.replace(/_/g, ' '),
+            mode: 'lines', line: {color: color, width: 2},
+          });
+          // CI band
+          traces.push({x: xAxis, y: comp.p95, mode: 'lines', line: {width: 0}, showlegend: false});
+          traces.push({x: xAxis, y: comp.p5, mode: 'lines', line: {width: 0}, fill: 'tonexty', fillcolor: color + '1a', showlegend: false});
+        });
+      }
+
+      const xTitle = (timeLabels || timeIndex) ? 'Date' : 'Time index';
+      Plotly.newPlot(plotDiv, traces, {
+        title: {text: `${nodeName} — Decomposition (${aggType})`, font: {size: 13}},
+        xaxis: {title: xTitle}, yaxis: {title: 'Contribution'},
+        margin: {l: 50, r: 20, t: 35, b: 40},
+        legend: {font: {size: 10}},
+        hovermode: 'x unified',
+        height: 300, paper_bgcolor: 'white', plot_bgcolor: 'white',
+      }, {responsive: true, displayModeBar: false});
+
+      // Coefficient bar chart
+      const nodeCoeffs = regCoeffs[nodeName];
+      if (nodeCoeffs && Object.keys(nodeCoeffs).length > 0) {
+        const coeffWrapId = `coeff-wrap-${runId}-${foldIdx}-${safeNode}`;
+        const coeffChartId = `coeff-chart-${runId}-${foldIdx}-${safeNode}`;
+        const coeffWrap = document.getElementById(coeffWrapId);
+        const coeffDiv = document.getElementById(coeffChartId);
+        if (coeffWrap && coeffDiv) {
+          coeffWrap.style.display = 'block';
+          const predNames = Object.keys(nodeCoeffs);
+          const means = predNames.map(p => nodeCoeffs[p].mean);
+          const q5s = predNames.map(p => nodeCoeffs[p].q5);
+          const q95s = predNames.map(p => nodeCoeffs[p].q95);
+          const errLo = means.map((m, i) => m - q5s[i]);
+          const errHi = means.map((m, i) => q95s[i] - m);
+
+          Plotly.newPlot(coeffDiv, [{
+            y: predNames, x: means, type: 'bar', orientation: 'h',
+            error_x: {type: 'data', symmetric: false, array: errHi, arrayminus: errLo, color: '#666'},
+            marker: {color: means.map(m => m >= 0 ? '#3b82f6' : '#ef4444')},
+          }], {
+            title: {text: `${nodeName} — Regression Coefficients (90% CI)`, font: {size: 13}},
+            xaxis: {title: 'Coefficient', zeroline: true, zerolinecolor: '#999'},
+            yaxis: {automargin: true},
+            margin: {l: 120, r: 20, t: 35, b: 40},
+            height: 250, paper_bgcolor: 'white', plot_bgcolor: 'white',
+          }, {responsive: true, displayModeBar: false});
+        }
+      }
+    }
+  } catch(e) {
+    // Decomposition not available — silently skip
   }
 }
 
@@ -1503,6 +1898,96 @@ async function submitRun(e) {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ---------------------------------------------------------------------------
+// Compare mode
+// ---------------------------------------------------------------------------
+
+let compareMode = false;
+let compareSelections = [];
+
+function openCompareMode() {
+  compareMode = true;
+  compareSelections = [];
+  const panel = document.getElementById('mainPanel');
+  panel.innerHTML = '<div class="placeholder">Select two runs from the sidebar to compare</div>';
+  loadRuns(); // Re-render sidebar with compare indicators
+}
+
+function selectForCompare(runId) {
+  if (compareSelections.includes(runId)) {
+    compareSelections = compareSelections.filter(id => id !== runId);
+  } else if (compareSelections.length < 2) {
+    compareSelections.push(runId);
+  }
+  loadRuns();
+  if (compareSelections.length === 2) {
+    runComparison(compareSelections[0], compareSelections[1]);
+  }
+}
+
+async function runComparison(runA, runB) {
+  const panel = document.getElementById('mainPanel');
+  panel.innerHTML = '<div class="placeholder">Loading comparison...</div>';
+  try {
+    const res = await fetch(`/api/compare?run_a=${encodeURIComponent(runA)}&run_b=${encodeURIComponent(runB)}`);
+    if (!res.ok) { panel.innerHTML = '<div class="placeholder">Failed to compare runs</div>'; return; }
+    const data = await res.json();
+    renderComparison(data);
+  } catch(e) {
+    panel.innerHTML = '<div class="placeholder">Error loading comparison</div>';
+  }
+}
+
+const LOWER_IS_BETTER = new Set(['mae','rmse','mape','smape','rolling_mape_3','rolling_mape_6','mape_full','crps']);
+const HIGHER_IS_BETTER = new Set(['coverage','accuracy','rolling_accuracy_3','rolling_accuracy_6','accuracy_full']);
+
+function renderComparison(data) {
+  const panel = document.getElementById('mainPanel');
+  let html = `<div class="detail-header">
+    <h1>Run Comparison</h1>
+    <div class="info">${esc(data.run_a.name)} vs ${esc(data.run_b.name)}</div>
+  </div>`;
+
+  html += '<button class="btn" onclick="compareMode=false;compareSelections=[];loadRuns();if(selectedRunId)selectRun(selectedRunId);else document.getElementById(\'mainPanel\').innerHTML=\'<div class=placeholder>Select a run from the sidebar</div>\';" style="margin-bottom:16px">Exit Compare</button>';
+
+  const metrics = data.metrics.filter(m => visibleMetrics.has(m));
+  html += '<div class="metrics-wrap compare-section"><table class="metrics-table compare-table"><thead><tr><th>Node</th>';
+  for (const m of metrics) {
+    const display = METRIC_DISPLAY_NAMES[m] || m;
+    html += `<th colspan="3" style="text-align:center">${esc(display)}</th>`;
+  }
+  html += '</tr><tr><th></th>';
+  for (const m of metrics) {
+    html += `<th style="font-size:10px">${esc(data.run_a.name)}</th><th style="font-size:10px">${esc(data.run_b.name)}</th><th style="font-size:10px">Δ</th>`;
+  }
+  html += '</tr></thead><tbody>';
+
+  for (const row of data.rows) {
+    html += `<tr><td>${esc(row.node)}</td>`;
+    for (const m of metrics) {
+      const va = row[m + '_a'];
+      const vb = row[m + '_b'];
+      const delta = row[m + '_delta'];
+      html += `<td>${fmtMetric(m, va)}</td>`;
+      html += `<td>${fmtMetric(m, vb)}</td>`;
+
+      let deltaCls = '';
+      if (delta != null && !isNaN(delta)) {
+        if (LOWER_IS_BETTER.has(m)) {
+          deltaCls = delta < -0.001 ? 'delta-good' : delta > 0.001 ? 'delta-bad' : 'delta-neutral';
+        } else if (HIGHER_IS_BETTER.has(m)) {
+          deltaCls = delta > 0.001 ? 'delta-good' : delta < -0.001 ? 'delta-bad' : 'delta-neutral';
+        }
+      }
+      const deltaStr = delta != null ? (delta > 0 ? '+' : '') + fmtMetric(m, delta) : '—';
+      html += `<td class="${deltaCls}">${deltaStr}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  panel.innerHTML = html;
+}
 
 loadRuns();
 </script>

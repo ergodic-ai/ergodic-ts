@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import numpyro
 import numpyro.distributions as dist
 
@@ -271,6 +272,15 @@ class TrendComponent(ABC):
     ) -> jnp.ndarray:
         """Roll forward from *final_state* → ``(horizon,)`` levels."""
 
+    def describe_params(
+        self, node_key: str, samples: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return structured parameter descriptions for the UI.
+
+        Override in subclasses for component-specific interpretations.
+        """
+        return {"type": self.component_name, "display_name": self.component_name, "cards": []}
+
     @property
     def state_dim(self) -> int:
         """Dimensionality of the carry state."""
@@ -340,6 +350,12 @@ class SeasonalityComponent(ABC):
     ) -> jnp.ndarray:
         """Return ``(horizon,)`` seasonal contribution for forecast period."""
 
+    def describe_params(
+        self, node_key: str, samples: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return structured parameter descriptions for the UI."""
+        return {"type": self.component_name, "display_name": self.component_name, "cards": []}
+
 
 class RegressionComponent(ABC):
     """Stateless, data-driven regression component.
@@ -405,6 +421,12 @@ class RegressionComponent(ABC):
         self, params: dict[str, Any], X_future: jnp.ndarray,
     ) -> jnp.ndarray:
         """X_future is ``(horizon, n_edges)``, return ``(horizon,)``."""
+
+    def describe_params(
+        self, node_key: str, samples: dict[str, Any], predictor_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return structured parameter descriptions for the UI."""
+        return {"type": self.component_name, "display_name": self.component_name, "cards": []}
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +500,21 @@ class LocalLinearTrend(TrendComponent, name="local_linear_trend"):
         _, levels = jax.lax.scan(scan_fn, final_state, (lev_inn, slp_inn))
         return levels
 
+    def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
+        post = self.extract_posterior(node_key, samples)
+        lsig = np.asarray(post["level_sigma"])
+        ssig = np.asarray(post["slope_sigma"])
+        return {
+            "type": self.component_name,
+            "display_name": "Local Linear Trend",
+            "cards": [
+                {"label": "Level volatility", "value": f"±{float(np.mean(lsig)):.4f}/step",
+                 "detail": f"std={float(np.std(lsig)):.4f}, 90% CI [{float(np.percentile(lsig,5)):.4f}, {float(np.percentile(lsig,95)):.4f}]"},
+                {"label": "Slope volatility", "value": f"±{float(np.mean(ssig)):.4f}/step",
+                 "detail": f"std={float(np.std(ssig)):.4f}, 90% CI [{float(np.percentile(ssig,5)):.4f}, {float(np.percentile(ssig,95)):.4f}]"},
+            ],
+        }
+
 
 class DampedLocalLinearTrend(TrendComponent, name="damped_local_linear_trend"):
     """Local linear trend with damped slope (phi < 1)."""
@@ -548,6 +585,26 @@ class DampedLocalLinearTrend(TrendComponent, name="damped_local_linear_trend"):
         _, levels = jax.lax.scan(scan_fn, final_state, (lev_inn, slp_inn))
         return levels
 
+    def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
+        post = self.extract_posterior(node_key, samples)
+        lsig = np.asarray(post["level_sigma"])
+        ssig = np.asarray(post["slope_sigma"])
+        phi = np.asarray(post["phi"])
+        mean_phi = float(np.mean(phi))
+        half_life = float(np.log(2) / max(-np.log(mean_phi), 1e-8)) if mean_phi < 1 else float('inf')
+        return {
+            "type": self.component_name,
+            "display_name": "Damped Local Linear Trend",
+            "cards": [
+                {"label": "Level volatility", "value": f"±{float(np.mean(lsig)):.4f}/step",
+                 "detail": f"90% CI [{float(np.percentile(lsig,5)):.4f}, {float(np.percentile(lsig,95)):.4f}]"},
+                {"label": "Slope volatility", "value": f"±{float(np.mean(ssig)):.4f}/step",
+                 "detail": f"90% CI [{float(np.percentile(ssig,5)):.4f}, {float(np.percentile(ssig,95)):.4f}]"},
+                {"label": "Momentum retention (φ)", "value": f"{mean_phi*100:.1f}%",
+                 "detail": f"Half-life: {half_life:.1f} steps, 90% CI [{float(np.percentile(phi,5)):.3f}, {float(np.percentile(phi,95)):.3f}]"},
+            ],
+        }
+
 
 class OUMeanReversion(TrendComponent, name="ou_mean_reversion"):
     """Ornstein-Uhlenbeck mean-reverting process.
@@ -612,6 +669,26 @@ class OUMeanReversion(TrendComponent, name="ou_mean_reversion"):
         _, levels = jax.lax.scan(scan_fn, final_state, inn)
         return levels
 
+    def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
+        post = self.extract_posterior(node_key, samples)
+        theta = np.asarray(post["theta"])
+        mu = np.asarray(post["mu"])
+        sigma = np.asarray(post["sigma"])
+        mean_theta = float(np.mean(theta))
+        half_life = float(np.log(2) / max(mean_theta, 1e-8))
+        return {
+            "type": self.component_name,
+            "display_name": "OU Mean Reversion",
+            "cards": [
+                {"label": "Mean-reversion speed (θ)", "value": f"{mean_theta:.4f}",
+                 "detail": f"Half-life: {half_life:.1f} steps"},
+                {"label": "Long-run level (μ)", "value": f"{float(np.mean(mu)):.4f}",
+                 "detail": f"90% CI [{float(np.percentile(mu,5)):.4f}, {float(np.percentile(mu,95)):.4f}]"},
+                {"label": "Shock size (σ)", "value": f"±{float(np.mean(sigma)):.4f}",
+                 "detail": f"90% CI [{float(np.percentile(sigma,5)):.4f}, {float(np.percentile(sigma,95)):.4f}]"},
+            ],
+        }
+
 
 # ---------------------------------------------------------------------------
 # Built-in seasonality components
@@ -656,6 +733,27 @@ class FourierSeasonality(SeasonalityComponent, name="fourier_seasonality"):
             freq = 2.0 * jnp.pi * (h + 1) * t_idx / self.period
             result = result + coeffs[2 * h] * jnp.sin(freq) + coeffs[2 * h + 1] * jnp.cos(freq)
         return result
+
+    def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
+        post = self.extract_posterior(node_key, samples)
+        coeffs = np.asarray(post["coeffs"])  # (S, 2*n_harmonics)
+        # Reconstruct seasonal pattern from posterior mean coefficients
+        mean_coeffs = np.mean(coeffs, axis=0)
+        t_idx = np.arange(int(self.period))
+        pattern = np.zeros(int(self.period))
+        for h in range(self.n_harmonics):
+            freq = 2.0 * np.pi * (h + 1) * t_idx / self.period
+            pattern += mean_coeffs[2 * h] * np.sin(freq) + mean_coeffs[2 * h + 1] * np.cos(freq)
+        return {
+            "type": self.component_name,
+            "display_name": f"Fourier Seasonality (P={self.period}, H={self.n_harmonics})",
+            "cards": [
+                {"label": "Period", "value": str(int(self.period))},
+                {"label": "Harmonics", "value": str(self.n_harmonics)},
+                {"label": "Peak-to-trough", "value": f"{float(np.max(pattern) - np.min(pattern)):.4f}"},
+            ],
+            "sparkline": pattern.tolist(),
+        }
 
 
 class MultiplicativeFourierSeasonality(SeasonalityComponent, name="multiplicative_fourier_seasonality"):
@@ -754,6 +852,20 @@ class MonthlySeasonality(SeasonalityComponent, name="monthly_seasonality"):
         month_idx = jnp.arange(T_hist, T_hist + horizon) % 12
         return params["month_effects"][month_idx]
 
+    def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
+        post = self.extract_posterior(node_key, samples)
+        effects = np.asarray(post["month_effects"])  # (S, 12)
+        mean_effects = np.mean(effects, axis=0)
+        return {
+            "type": self.component_name,
+            "display_name": "Monthly Seasonality",
+            "cards": [
+                {"label": "Period", "value": "12"},
+                {"label": "Peak-to-trough", "value": f"{float(np.max(mean_effects) - np.min(mean_effects)):.4f}"},
+            ],
+            "sparkline": mean_effects.tolist(),
+        }
+
 
 class MultiplicativeMonthlySeasonality(SeasonalityComponent, name="multiplicative_monthly_seasonality"):
     """Per-period dummy seasonality normalised for multiplicative composition.
@@ -834,6 +946,34 @@ class ExternalRegression(RegressionComponent, name="external_regression"):
         self, params: dict[str, Any], X_future: jnp.ndarray,
     ) -> jnp.ndarray:
         return jnp.dot(X_future, params["betas"])
+
+    def describe_params(
+        self, node_key: str, samples: dict[str, Any], predictor_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        post = self.extract_posterior(node_key, samples)
+        betas = np.asarray(post["betas"])  # (S, n_predictors)
+        n_pred = betas.shape[1]
+        names = predictor_names or [f"X{j}" for j in range(n_pred)]
+        cards = []
+        coeff_data = []
+        for j in range(n_pred):
+            b = betas[:, j]
+            mean_b = float(np.mean(b))
+            cards.append({
+                "label": f"β_{names[j]}",
+                "value": f"{mean_b:.4f}",
+                "detail": f"90% CI [{float(np.percentile(b,5)):.4f}, {float(np.percentile(b,95)):.4f}]",
+            })
+            coeff_data.append({
+                "name": names[j], "mean": mean_b,
+                "q5": float(np.percentile(b, 5)), "q95": float(np.percentile(b, 95)),
+            })
+        return {
+            "type": self.component_name,
+            "display_name": "External Regression",
+            "cards": cards,
+            "coefficient_chart": coeff_data,
+        }
 
 
 # ---------------------------------------------------------------------------

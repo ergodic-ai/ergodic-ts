@@ -351,10 +351,103 @@ class TrendComponent(ABC):
         """
         return {"type": self.component_name, "display_name": self.component_name, "cards": []}
 
+    def inject_data(
+        self, y_node: jnp.ndarray, T: int, horizon: int,
+    ) -> dict[str, jnp.ndarray]:
+        """Return extra innovation entries derived from observed data.
+
+        Called by the forecaster after assembling standard innovations.
+        The default returns an empty dict (no data injection needed).
+        Override in subclasses that need teacher-forcing or similar.
+        """
+        return {}
+
     @property
     def state_dim(self) -> int:
         """Dimensionality of the carry state."""
         return 2
+
+    # -- Batched scan protocol (vmap + lax.scan) ---------------------------
+
+    def prepare_batch_data(
+        self, group: list[tuple],
+    ) -> tuple[jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray]]:
+        """Stack per-node data for vmap.
+
+        Parameters
+        ----------
+        group
+            List of ``(node_index, node_key, params, innovations, init)`` tuples,
+            all sharing the same trend component type.
+
+        Returns
+        -------
+        tuple of (inits, innovations, scalar_params)
+            - inits: ``(N, state_dim)``
+            - innovations: ``(N, total_T, inn_dim)``
+            - scalar_params: dict of ``(N,)`` arrays
+        """
+        raise NotImplementedError
+
+    def _make_scan_step_fn(
+        self, scalar_params: dict[str, jnp.ndarray],
+    ):
+        """Return a ``(carry, inn_t) -> (carry, level)`` function for a single node.
+
+        *scalar_params* contains scalar values (not batched).
+        """
+        raise NotImplementedError
+
+    def batched_scan(
+        self, group: list[tuple], total_T: int,
+    ) -> dict[int, tuple[jnp.ndarray, jnp.ndarray]]:
+        """Run the trend scan batched over N nodes via vmap + lax.scan.
+
+        Falls back to sequential per-node scan if ``prepare_batch_data``
+        is not implemented (custom TrendComponents).
+
+        Returns
+        -------
+        dict mapping ``node_index -> (final_carry, all_levels)``
+        """
+        try:
+            inits, innovations, scalar_params = self.prepare_batch_data(group)
+        except NotImplementedError:
+            # Fallback: sequential scan for custom trend types
+            results: dict[int, tuple[jnp.ndarray, jnp.ndarray]] = {}
+            for g in group:
+                idx, node_key, params, all_innovations, init = g
+                def _make_scan_fn(component, parameters, innovations):
+                    def scan_fn(carry, t_idx):
+                        inn_t = {
+                            inn_key: all_inn[t_idx]
+                            for inn_key, all_inn in innovations.items()
+                        }
+                        new_carry, level_t = component.transition_fn(carry, inn_t, parameters)
+                        return new_carry, level_t
+                    return scan_fn
+                scan_fn = _make_scan_fn(self, params, all_innovations)
+                final_carry, levels = jax.lax.scan(
+                    scan_fn, init, jnp.arange(total_T),
+                )
+                results[idx] = (final_carry, levels)
+            return results
+
+        step_fn = self._make_scan_step_fn
+
+        def _single_scan(init, inns, *param_vals):
+            param_dict = dict(zip(scalar_params.keys(), param_vals))
+            fn = step_fn(param_dict)
+            return jax.lax.scan(fn, init, inns)
+
+        final_carries, all_levels = jax.vmap(_single_scan)(
+            inits, innovations, *scalar_params.values(),
+        )
+
+        results = {}
+        for j, g in enumerate(group):
+            results[g[0]] = (final_carries[j], all_levels[j])
+        return results
 
 
 class SeasonalityComponent(ABC):
@@ -599,6 +692,28 @@ class LocalLinearTrend(TrendComponent, name="local_linear_trend"):
         _, levels = jax.lax.scan(scan_fn, final_state, (lev_inn, slp_inn))
         return levels
 
+    def prepare_batch_data(self, group):
+        inits = jnp.stack([g[4] for g in group])
+        innovations = jnp.stack([
+            jnp.stack([g[3]["lev_inn"], g[3]["slp_inn"]], axis=-1)
+            for g in group
+        ])
+        scalar_params = {
+            "level_sigma": jnp.stack([g[2]["level_sigma"] for g in group]),
+            "slope_sigma": jnp.stack([g[2]["slope_sigma"] for g in group]),
+        }
+        return inits, innovations, scalar_params
+
+    def _make_scan_step_fn(self, params):
+        lsig = params["level_sigma"]
+        ssig = params["slope_sigma"]
+        def step(carry, inn_t):
+            level, slope = carry[0], carry[1]
+            new_level = level + slope + lsig * inn_t[0]
+            new_slope = slope + ssig * inn_t[1]
+            return jnp.array([new_level, new_slope]), new_level
+        return step
+
     def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
         post = self.extract_posterior(node_key, samples)
         lsig = np.asarray(post["level_sigma"])
@@ -716,6 +831,30 @@ class DampedLocalLinearTrend(TrendComponent, name="damped_local_linear_trend"):
         _, levels = jax.lax.scan(scan_fn, final_state, (lev_inn, slp_inn))
         return levels
 
+    def prepare_batch_data(self, group):
+        inits = jnp.stack([g[4] for g in group])
+        innovations = jnp.stack([
+            jnp.stack([g[3]["lev_inn"], g[3]["slp_inn"]], axis=-1)
+            for g in group
+        ])
+        scalar_params = {
+            "level_sigma": jnp.stack([g[2]["level_sigma"] for g in group]),
+            "slope_sigma": jnp.stack([g[2]["slope_sigma"] for g in group]),
+            "phi": jnp.stack([g[2]["phi"] for g in group]),
+        }
+        return inits, innovations, scalar_params
+
+    def _make_scan_step_fn(self, params):
+        lsig = params["level_sigma"]
+        ssig = params["slope_sigma"]
+        phi = params["phi"]
+        def step(carry, inn_t):
+            level, slope = carry[0], carry[1]
+            new_level = level + slope + lsig * inn_t[0]
+            new_slope = phi * slope + ssig * inn_t[1]
+            return jnp.array([new_level, new_slope]), new_level
+        return step
+
     def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
         post = self.extract_posterior(node_key, samples)
         lsig = np.asarray(post["level_sigma"])
@@ -824,6 +963,29 @@ class OUMeanReversion(TrendComponent, name="ou_mean_reversion"):
         _, levels = jax.lax.scan(scan_fn, final_state, inn)
         return levels
 
+    def prepare_batch_data(self, group):
+        inits = jnp.stack([g[4] for g in group])
+        innovations = jnp.stack([
+            g[3]["inn"][:, None]  # (total_T, 1)
+            for g in group
+        ])
+        scalar_params = {
+            "theta": jnp.stack([g[2]["theta"] for g in group]),
+            "mu": jnp.stack([g[2]["mu"] for g in group]),
+            "sigma": jnp.stack([g[2]["sigma"] for g in group]),
+        }
+        return inits, innovations, scalar_params
+
+    def _make_scan_step_fn(self, params):
+        theta = params["theta"]
+        mu = params["mu"]
+        sigma = params["sigma"]
+        def step(carry, inn_t):
+            level = carry[0]
+            new_level = level + theta * (mu - level) + sigma * inn_t[0]
+            return jnp.array([new_level]), new_level
+        return step
+
     def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
         post = self.extract_posterior(node_key, samples)
         theta = np.asarray(post["theta"])
@@ -841,6 +1003,248 @@ class OUMeanReversion(TrendComponent, name="ou_mean_reversion"):
                  "detail": f"90% CI [{float(np.percentile(mu,5)):.4f}, {float(np.percentile(mu,95)):.4f}]"},
                 {"label": "Shock size (σ)", "value": f"±{float(np.mean(sigma)):.4f}",
                  "detail": f"90% CI [{float(np.percentile(sigma,5)):.4f}, {float(np.percentile(sigma,95)):.4f}]"},
+            ],
+        }
+
+
+class BassTrend(TrendComponent, name="bass_diffusion"):
+    """Bass diffusion trend for new product introduction (NPI) forecasting.
+
+    Models the classic Bass diffusion S-curve where adoption follows:
+
+    .. math::
+
+        \\Delta S_t = (M - S_{t-1}) \\cdot \\bigl(p + q \\cdot S_{t-1} / M\\bigr)
+
+    The component emits incremental adoption :math:`\\Delta S_t` (not
+    cumulative) so it composes naturally with seasonality and regression.
+
+    During training, observed cumulative data is injected via
+    :meth:`inject_data` for teacher-forcing, preventing error compounding.
+    During forecasting, :meth:`forecast_from_state` runs autoregressively.
+
+    Parameters
+    ----------
+    p_prior : tuple[float, float]
+        Beta(alpha, beta) hyperparameters for the innovation coefficient.
+        Default ``(1, 19)`` gives prior mean ~0.05.
+    q_prior : tuple[float, float]
+        Beta(alpha, beta) hyperparameters for the imitation coefficient.
+        Default ``(2, 5)`` gives prior mean ~0.29.
+    M_prior : tuple[float, float]
+        LogNormal(mu, sigma) hyperparameters for market potential.
+        Default ``(0, 1)`` centres around ~1.0 on ratio-scaled data.
+
+    State dimension: 2 ``[S_cumulative, last_incremental]``.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import BassTrend
+    from ergodicts import NodeConfig
+
+    # Default (uninformative) priors
+    cfg = NodeConfig(components=(BassTrend(),))
+
+    # Informative priors from a previous generation's posterior
+    gen3 = BassTrend.from_posterior(fitted_samples, "GEN2_node_key")
+    cfg = NodeConfig(components=(gen3,))
+
+    # Tight prior on M from business TAM estimate (ratio-scaled)
+    cfg = NodeConfig(components=(BassTrend(M_prior=(1.5, 0.2)),))
+    ```
+    """
+
+    def __init__(
+        self,
+        p_prior: tuple[float, float] = (1.0, 19.0),
+        q_prior: tuple[float, float] = (2.0, 5.0),
+        M_prior: tuple[float, float] = (0.0, 1.0),
+    ) -> None:
+        self.p_prior = tuple(p_prior)
+        self.q_prior = tuple(q_prior)
+        self.M_prior = tuple(M_prior)
+
+    @classmethod
+    def from_posterior(
+        cls,
+        samples: dict[str, Any],
+        node_key: str,
+        *,
+        M_prior: tuple[float, float] | None = None,
+    ) -> BassTrend:
+        """Create a BassTrend with priors moment-matched to a previous fit.
+
+        Takes the posterior samples from a fitted generation and converts
+        them into informative Beta/LogNormal priors for the next generation.
+        This is the standard "analog curve" approach for NPI forecasting.
+
+        Parameters
+        ----------
+        samples
+            Posterior samples dict from a fitted model (``model._samples``).
+        node_key
+            The node key string of the previous generation.
+        M_prior
+            Override for M prior.  If ``None``, moment-matches from the
+            posterior.  Pass an explicit value to anchor M to a business
+            estimate (e.g. ``(log(TAM/median), 0.2)``).
+
+        Returns
+        -------
+        BassTrend
+            New instance with informative priors.
+        """
+        p_samples = np.asarray(samples[f"bass_p_{node_key}"])
+        q_samples = np.asarray(samples[f"bass_q_{node_key}"])
+
+        p_prior = cls._beta_moment_match(p_samples)
+        q_prior = cls._beta_moment_match(q_samples)
+
+        if M_prior is None:
+            M_samples = np.asarray(samples[f"bass_M_{node_key}"])
+            M_prior = cls._lognormal_moment_match(M_samples)
+
+        return cls(p_prior=p_prior, q_prior=q_prior, M_prior=M_prior)
+
+    @staticmethod
+    def _beta_moment_match(
+        samples: np.ndarray,
+    ) -> tuple[float, float]:
+        """Moment-match samples on (0, 1) to Beta(alpha, beta)."""
+        mu = float(np.mean(samples))
+        var = float(np.var(samples))
+        # Clamp to valid range
+        mu = np.clip(mu, 1e-4, 1 - 1e-4)
+        var = min(var, mu * (1 - mu) - 1e-6)
+        var = max(var, 1e-8)
+        common = mu * (1 - mu) / var - 1.0
+        common = max(common, 2.0)  # ensure alpha, beta > 0
+        alpha = mu * common
+        beta = (1 - mu) * common
+        return (float(alpha), float(beta))
+
+    @staticmethod
+    def _lognormal_moment_match(
+        samples: np.ndarray,
+    ) -> tuple[float, float]:
+        """Moment-match positive samples to LogNormal(mu, sigma)."""
+        log_samples = np.log(np.maximum(samples, 1e-8))
+        mu = float(np.mean(log_samples))
+        sigma = float(np.std(log_samples))
+        sigma = max(sigma, 0.01)
+        return (mu, sigma)
+
+    @property
+    def state_dim(self) -> int:
+        return 2
+
+    def sample_params(self, node_key: str) -> dict[str, Any]:
+        p = numpyro.sample(
+            f"bass_p_{node_key}",
+            dist.Beta(self.p_prior[0], self.p_prior[1]),
+        )
+        q = numpyro.sample(
+            f"bass_q_{node_key}",
+            dist.Beta(self.q_prior[0], self.q_prior[1]),
+        )
+        M = numpyro.sample(
+            f"bass_M_{node_key}",
+            dist.LogNormal(self.M_prior[0], self.M_prior[1]),
+        )
+        return {"p": p, "q": q, "M": M}
+
+    def sample_innovations(self, node_key: str, T: int) -> dict[str, jnp.ndarray]:
+        inn = numpyro.sample(
+            f"bass_inn_{node_key}", dist.Normal(0, 1).expand([T]),
+        )
+        return {"inn": inn, "obs_cumulative": jnp.zeros(T)}
+
+    def inject_data(
+        self, y_node: jnp.ndarray, T: int, horizon: int,
+    ) -> dict[str, jnp.ndarray]:
+        obs_cum = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(y_node)[:-1]])
+        if horizon > 0:
+            obs_cum = jnp.concatenate([obs_cum, jnp.zeros(horizon)])
+        return {"obs_cumulative": obs_cum}
+
+    def init_state(self, params: dict[str, Any]) -> jnp.ndarray:
+        return jnp.array([0.0, 0.0])
+
+    def transition_fn(
+        self,
+        carry: jnp.ndarray,
+        innovations: dict[str, jnp.ndarray],
+        params: dict[str, Any],
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        S_prev = innovations["obs_cumulative"]
+        p, q, M = params["p"], params["q"], params["M"]
+        remaining = jnp.maximum(M - S_prev, 0.0)
+        adoption_rate = p + q * S_prev / jnp.maximum(M, 1e-8)
+        incremental = remaining * adoption_rate
+        incremental = jnp.maximum(incremental, 0.0)
+        new_S = S_prev + incremental
+        new_carry = jnp.array([new_S, incremental])
+        return new_carry, incremental
+
+    def extract_posterior(
+        self, node_key: str, samples: dict[str, jnp.ndarray],
+    ) -> dict[str, jnp.ndarray]:
+        return {
+            "p": samples[f"bass_p_{node_key}"],
+            "q": samples[f"bass_q_{node_key}"],
+            "M": samples[f"bass_M_{node_key}"],
+        }
+
+    def forecast_from_state(
+        self,
+        final_state: jnp.ndarray,
+        params: dict[str, Any],
+        horizon: int,
+        rng_key: jax.Array,
+    ) -> jnp.ndarray:
+        p, q, M = params["p"], params["q"], params["M"]
+        noise = jr.normal(rng_key, (horizon,)) * 0.01
+
+        def scan_fn(carry, eps):
+            S_prev, _ = carry[0], carry[1]
+            remaining = jnp.maximum(M - S_prev, 0.0)
+            adoption_rate = p + q * S_prev / jnp.maximum(M, 1e-8)
+            incremental = remaining * adoption_rate + eps
+            incremental = jnp.maximum(incremental, 0.0)
+            new_S = S_prev + incremental
+            return jnp.array([new_S, incremental]), incremental
+
+        _, levels = jax.lax.scan(scan_fn, final_state, noise)
+        return levels
+
+    def describe_params(self, node_key: str, samples: dict[str, Any]) -> dict[str, Any]:
+        post = self.extract_posterior(node_key, samples)
+        p_vals = np.asarray(post["p"])
+        q_vals = np.asarray(post["q"])
+        M_vals = np.asarray(post["M"])
+        mean_p = float(np.mean(p_vals))
+        mean_q = float(np.mean(q_vals))
+        mean_M = float(np.mean(M_vals))
+        # Time to peak: t* = -ln(p/q) / (p+q) when q > p
+        if mean_q > mean_p and mean_p > 0:
+            t_peak = -np.log(mean_p / mean_q) / (mean_p + mean_q)
+        else:
+            t_peak = 0.0
+        return {
+            "type": self.component_name,
+            "display_name": "Bass Diffusion",
+            "cards": [
+                {"label": "Innovation (p)", "value": f"{mean_p:.4f}",
+                 "detail": f"Prior: Beta({self.p_prior[0]:.1f}, {self.p_prior[1]:.1f}), "
+                           f"90% CI [{float(np.percentile(p_vals,5)):.4f}, {float(np.percentile(p_vals,95)):.4f}]"},
+                {"label": "Imitation (q)", "value": f"{mean_q:.4f}",
+                 "detail": f"Prior: Beta({self.q_prior[0]:.1f}, {self.q_prior[1]:.1f}), "
+                           f"90% CI [{float(np.percentile(q_vals,5)):.4f}, {float(np.percentile(q_vals,95)):.4f}]"},
+                {"label": "Market potential (M)", "value": f"{mean_M:.4f}",
+                 "detail": f"Prior: LogN({self.M_prior[0]:.2f}, {self.M_prior[1]:.2f}), "
+                           f"90% CI [{float(np.percentile(M_vals,5)):.4f}, {float(np.percentile(M_vals,95)):.4f}]"},
+                {"label": "Time to peak", "value": f"{t_peak:.1f} steps"},
             ],
         }
 
@@ -1213,15 +1617,28 @@ class ExternalRegression(RegressionComponent, name="external_regression"):
 Component = TrendComponent | SeasonalityComponent | RegressionComponent
 
 
-def resolve_components(cfg: NodeConfig) -> list[Component]:
+def resolve_components(
+    cfg: NodeConfig,
+    predictor_edges: list | None = None,
+) -> list[Component]:
     """Return the component list for *cfg*.
 
     When ``cfg.components`` is ``None``, defaults to a single
     :class:`LocalLinearTrend`.
+
+    When *predictor_edges* is non-empty and no
+    :class:`RegressionComponent` is already present, an
+    :class:`ExternalRegression` is auto-appended.
     """
     if cfg.components is not None:
-        return list(cfg.components)
-    return [LocalLinearTrend()]
+        components = list(cfg.components)
+    else:
+        components = [LocalLinearTrend()]
+
+    if predictor_edges and not any(isinstance(c, RegressionComponent) for c in components):
+        components.append(ExternalRegression())
+
+    return components
 
 
 # ---------------------------------------------------------------------------

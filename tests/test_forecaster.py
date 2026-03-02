@@ -7,6 +7,7 @@ import pytest
 
 from ergodicts.causal_dag import CausalDAG, ExternalNode, NodeConfig
 from ergodicts.components import (
+    BassTrend,
     DampedLocalLinearTrend,
     FourierSeasonality,
     LocalLinearTrend,
@@ -445,3 +446,159 @@ class TestComponentBasedConfig:
         assert np.all(np.isfinite(forecasts[child_a]))
         assert forecasts[child_b].shape == (5, 6)
         assert parent in forecasts
+
+
+# ---------------------------------------------------------------------------
+# TestForecastDecomposition — merged forecast / decomposition
+# ---------------------------------------------------------------------------
+
+
+class TestForecastDecomposition:
+    @pytest.fixture
+    def fitted_model(self, hierarchy, tiny_dag, tiny_y, tiny_x, child_a, child_b, parent):
+        configs = {
+            parent: NodeConfig(mode="active", components=(LocalLinearTrend(), FourierSeasonality(n_harmonics=1))),
+            child_a: NodeConfig(mode="active", components=(LocalLinearTrend(), FourierSeasonality(n_harmonics=1))),
+            child_b: NodeConfig(mode="active", components=(LocalLinearTrend(), FourierSeasonality(n_harmonics=1))),
+        }
+        model = HierarchicalForecaster(
+            hierarchy=hierarchy,
+            causal_dag=tiny_dag,
+            node_configs=configs,
+            reconciliation="bottom_up",
+        )
+        model.fit(
+            y_data=tiny_y,
+            x_data=tiny_x,
+            num_warmup=5,
+            num_samples=5,
+            rng_seed=0,
+        )
+        return model
+
+    def test_forecast_decomposed_matches_forecast(self, fitted_model, child_a, child_b):
+        """Same rng_seed → same forecast values from both methods."""
+        forecasts_plain = fitted_model.forecast(horizon=6, rng_seed=42)
+        forecasts_decomp, decomp = fitted_model.forecast_decomposed(horizon=6, rng_seed=42)
+
+        for key in [child_a, child_b]:
+            np.testing.assert_allclose(
+                forecasts_plain[key],
+                forecasts_decomp[key],
+                atol=1e-4,
+                err_msg=f"Forecast mismatch for {key}",
+            )
+
+    def test_decomposition_has_expected_keys(self, fitted_model, child_a, child_b):
+        """Decomposition has trend and seasonality labels."""
+        _, decomp = fitted_model.forecast_decomposed(horizon=6)
+
+        for key in [child_a, child_b]:
+            assert key in decomp.contributions
+            contrib = decomp.contributions[key]
+            assert "trend_local_linear_trend" in contrib
+            assert "seasonality_fourier_seasonality" in contrib
+
+        # Regression contributions should be present (dag has edges)
+        for key in [child_a, child_b]:
+            assert "regression_total" in decomp.contributions[key]
+
+    def test_decomposition_shapes(self, fitted_model, child_a):
+        """Each decomposition contribution has (num_samples, horizon) shape."""
+        _, decomp = fitted_model.forecast_decomposed(horizon=6)
+        for label, arr in decomp.contributions[child_a].items():
+            assert arr.shape == (5, 6), f"{label} has wrong shape: {arr.shape}"
+
+
+# ---------------------------------------------------------------------------
+# TestReconciliation
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliation:
+    def test_bottom_up_root_equals_sum(self, hierarchy, tiny_dag, tiny_y, tiny_x, child_a, child_b, parent):
+        """Bottom-up: root forecast = sum of leaf forecasts."""
+        configs = {
+            parent: NodeConfig(mode="active", components=(LocalLinearTrend(),)),
+            child_a: NodeConfig(mode="active", components=(LocalLinearTrend(),)),
+            child_b: NodeConfig(mode="active", components=(LocalLinearTrend(),)),
+        }
+        model = HierarchicalForecaster(
+            hierarchy=hierarchy,
+            causal_dag=tiny_dag,
+            node_configs=configs,
+            reconciliation="bottom_up",
+        )
+        model.fit(y_data=tiny_y, x_data=tiny_x, num_warmup=5, num_samples=5)
+        forecasts = model.forecast(horizon=4)
+
+        assert parent in forecasts
+        expected_root = forecasts[child_a] + forecasts[child_b]
+        np.testing.assert_allclose(forecasts[parent], expected_root, atol=1e-5)
+
+    def test_no_reconciliation(self, hierarchy, tiny_dag, tiny_y, tiny_x, child_a, child_b, parent):
+        """reconciliation='none': root is NOT in results."""
+        configs = {
+            parent: NodeConfig(mode="active", components=(LocalLinearTrend(),)),
+            child_a: NodeConfig(mode="active", components=(LocalLinearTrend(),)),
+            child_b: NodeConfig(mode="active", components=(LocalLinearTrend(),)),
+        }
+        model = HierarchicalForecaster(
+            hierarchy=hierarchy,
+            causal_dag=tiny_dag,
+            node_configs=configs,
+            reconciliation="none",
+        )
+        model.fit(y_data=tiny_y, x_data=tiny_x, num_warmup=5, num_samples=5)
+        forecasts = model.forecast(horizon=4)
+
+        assert parent not in forecasts
+        assert child_a in forecasts
+        assert child_b in forecasts
+
+
+# ---------------------------------------------------------------------------
+# TestBassTrendIntegration — Bass diffusion with the forecaster
+# ---------------------------------------------------------------------------
+
+
+class TestBassTrendIntegration:
+    def test_bass_diffusion_forecast(self):
+        """BassTrend fits synthetic S-curve data and produces valid forecasts."""
+        # Synthetic Bass diffusion data: incremental adoption
+        T = 36
+        p_true, q_true, M_true = 0.03, 0.4, 200.0
+        S = np.zeros(T + 1)
+        incremental = np.zeros(T)
+        for t in range(T):
+            inc = (M_true - S[t]) * (p_true + q_true * S[t] / M_true)
+            incremental[t] = max(inc, 0)
+            S[t + 1] = S[t] + incremental[t]
+
+        node_a = ModelKey(("GEN",), ("ProductA",))
+        hierarchy = DependencyGraph()
+        dag = CausalDAG()
+
+        configs = {
+            node_a: NodeConfig(mode="active", components=(BassTrend(),)),
+        }
+        model = HierarchicalForecaster(
+            hierarchy=hierarchy,
+            causal_dag=dag,
+            node_configs=configs,
+            reconciliation="none",
+        )
+        model.fit(
+            y_data={node_a: incremental},
+            num_warmup=5,
+            num_samples=5,
+            rng_seed=0,
+        )
+        forecasts = model.forecast(horizon=12)
+
+        assert node_a in forecasts
+        assert forecasts[node_a].shape == (5, 12)
+        assert np.all(np.isfinite(forecasts[node_a]))
+        # Forecasts should be non-negative (adoption can't be negative)
+        # Allow small negative due to obs noise
+        assert np.all(forecasts[node_a] > -50)

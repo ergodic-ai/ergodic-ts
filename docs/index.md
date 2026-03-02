@@ -25,21 +25,7 @@ NumPyro for Bayesian inference and JAX for hardware-accelerated computation.
 
 ## Architecture
 
-```
-Raw Data  →  Reducer  →  Hierarchy + CausalDAG  →  Forecaster  →  Forecasts
-                              ↑                         ↑
-                         NodeConfig              NumPyro (NUTS/SVI)
-                       (components,
-                        aggregator)
-
-Forecasts  →  Harmonizer  →  Reconciled Forecasts
-                                    ↑
-                             Constraints
-                          (hierarchy, price,
-                            elasticity)
-
-Forecasts  →  Backtester  →  BacktestSummary  →  Dashboard Server
-```
+![Architecture](assets/images/architecture.jpeg)
 
 ## Modules
 

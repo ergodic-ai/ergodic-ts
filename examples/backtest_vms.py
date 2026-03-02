@@ -64,7 +64,8 @@ df = client.get_data(
             DATE,
             'HE' as CATEGORY,
             VMS_TOP_NAME,
-            SUM(AMT) AMT
+            SUM(AMT) AMT,
+            SUM(QTY) QTY
         FROM ERG_DEALS
         WHERE ERG_DEALS.END_CUSTOMER_GU_NAME NOT IN (SELECT END_CUSTOMER_GU_NAME FROM ERG_DISTIS)
         and PLATFORM_NAME like '%Stratocaster%'

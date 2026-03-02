@@ -33,6 +33,7 @@ from ergodicts.components import (
     LocalLinearTrend,
     DampedLocalLinearTrend,
     OUMeanReversion,
+    BassTrend,
     FourierSeasonality,
     MultiplicativeFourierSeasonality,
     MultiplicativeMonthlySeasonality,

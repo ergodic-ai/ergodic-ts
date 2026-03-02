@@ -208,7 +208,10 @@ class PriceConstraint(Constraint):
         qty = factors[self.qty_key]
         dollars = factors[self.dollar_key]
         residual = asp * qty - dollars
-        scale = jnp.maximum(jnp.abs(dollars).mean(), 1e-6)
+        # Normalise by per-timestep dollar magnitude so the penalty
+        # is scale-free (a 1% residual gets the same penalty regardless
+        # of whether dollars are ~100 or ~100k).
+        scale = jnp.maximum(jnp.abs(dollars), 1e-6)
         return -lambda_weight * jnp.sum((residual / scale) ** 2)
 
     def __repr__(self) -> str:
@@ -474,12 +477,18 @@ class Harmonizer:
 
         def model() -> None:
             factors: dict[ModelKey, Any] = {}
+            # Non-centered parameterization: sample unit-normal deltas,
+            # then transform to original scale.  This ensures all latent
+            # variables live on comparable scales, which dramatically
+            # improves NUTS geometry when series span different magnitudes
+            # (e.g. ASP ~50, Qty ~1000, Revenue ~50000).
             for key in ordered_keys:
                 mu, std = belief_stats[key]
-                factors[key] = numpyro.sample(
-                    f"f_{key}",
-                    dist.Normal(mu, std).to_event(1),
+                z = numpyro.sample(
+                    f"z_{key}",
+                    dist.Normal(jnp.zeros_like(mu), 1.0).to_event(1),
                 )
+                factors[key] = numpyro.deterministic(f"f_{key}", mu + std * z)
 
             # elasticity parameters
             elasticities: dict[int, Any] = {}

@@ -8,13 +8,7 @@ sums of product lines, regions, etc.  **Hierarchical forecasting** exploits
 this structure to produce forecasts that are both accurate at each level and
 coherent across levels — i.e. the parts always add up to the whole.
 
-```
-          Total
-        /   |   \
-      BU_A BU_B BU_C      ← parent level
-     / \    |    / \
-    p1 p2  p3  p4  p5     ← leaf level
-```
+![Hierarchy tree](../assets/images/hierarchy.jpeg)
 
 ## Aggregation constraints
 

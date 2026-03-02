@@ -96,8 +96,28 @@ r_t = \sum_j \beta_j\, x_{j,t}
 $$
 
 Predictors are linked via the [CausalDAG][ergodicts.causal_dag.CausalDAG].
-This component is **automatically included** for any leaf node with incoming
-DAG edges — you don't add it to `NodeConfig.components`.
+This component is **automatically included** via
+[`resolve_components`][ergodicts.components.resolve_components]
+for any leaf node with incoming DAG edges — you don't add it to
+`NodeConfig.components`.  If you explicitly include a
+`RegressionComponent` in `NodeConfig.components`, auto-attachment is
+suppressed.
+
+## Batched scan protocol
+
+For large hierarchies, trend scans are **batched** using `jax.vmap` over
+nodes of the same type.  Each `TrendComponent` subclass implements three
+methods:
+
+| Method | Purpose |
+|--------|---------|
+| `prepare_batch_data(group)` | Stack per-node data into `(N, T, ...)` tensors |
+| `_make_scan_step_fn(params)` | Return a `(carry, inn_t) → (carry, level)` step function |
+| `batched_scan(group, total_T)` | Default vmap + scan implementation using the above two |
+
+Custom `TrendComponent` subclasses get a **fallback sequential scan** if
+they don't override these methods — the forecaster will still work, just
+without vmap batching (slower for large hierarchies).
 
 ## Aggregator selection guide
 

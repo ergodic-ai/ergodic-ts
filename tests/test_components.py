@@ -14,6 +14,7 @@ from numpyro.infer import MCMC, NUTS
 from ergodicts.causal_dag import NodeConfig
 from ergodicts.components import (
     AdditiveAggregator,
+    BassTrend,
     DampedLocalLinearTrend,
     ExternalRegression,
     FourierSeasonality,
@@ -169,6 +170,7 @@ class TestComponentRole:
         assert component_role(LocalLinearTrend()) == "trend"
         assert component_role(DampedLocalLinearTrend()) == "trend"
         assert component_role(OUMeanReversion()) == "trend"
+        assert component_role(BassTrend()) == "trend"
 
     def test_seasonality(self):
         assert component_role(FourierSeasonality()) == "seasonality"
@@ -312,6 +314,178 @@ class TestOUMeanReversion:
         }
         levels = comp.forecast_from_state(state, params, 10, jr.PRNGKey(0))
         assert levels.shape == (10,)
+
+
+class TestBassTrend:
+    def test_sample_params_keys(self):
+        comp = BassTrend()
+
+        def model():
+            params = comp.sample_params("test")
+            assert "p" in params
+            assert "q" in params
+            assert "M" in params
+
+        with numpyro.handlers.seed(rng_seed=0):
+            model()
+
+    def test_sample_innovations_shape(self):
+        comp = BassTrend()
+
+        def model():
+            inn = comp.sample_innovations("test", 24)
+            assert inn["inn"].shape == (24,)
+            assert inn["obs_cumulative"].shape == (24,)
+
+        with numpyro.handlers.seed(rng_seed=0):
+            model()
+
+    def test_init_state_shape(self):
+        comp = BassTrend()
+        params = {"p": jnp.array(0.05), "q": jnp.array(0.3), "M": jnp.array(1.0)}
+        state = comp.init_state(params)
+        assert state.shape == (2,)
+        assert state[0] == 0.0
+        assert state[1] == 0.0
+
+    def test_transition_fn(self):
+        comp = BassTrend()
+        carry = jnp.array([0.0, 0.0])
+        p, q, M = 0.05, 0.3, 100.0
+        S_prev = 10.0
+        inn = {"inn": jnp.array(0.0), "obs_cumulative": jnp.array(S_prev)}
+        params = {"p": jnp.array(p), "q": jnp.array(q), "M": jnp.array(M)}
+        new_carry, incremental = comp.transition_fn(carry, inn, params)
+        # incremental = (M - S_prev) * (p + q * S_prev / M)
+        expected = (100.0 - 10.0) * (0.05 + 0.3 * 10.0 / 100.0)
+        np.testing.assert_allclose(float(incremental), expected, atol=1e-5)
+
+    def test_transition_zero_before_launch(self):
+        comp = BassTrend()
+        carry = jnp.array([0.0, 0.0])
+        inn = {"inn": jnp.array(0.0), "obs_cumulative": jnp.array(0.0)}
+        params = {"p": jnp.array(0.01), "q": jnp.array(0.3), "M": jnp.array(1.0)}
+        _, incremental = comp.transition_fn(carry, inn, params)
+        # S=0 → incremental = M * p = 0.01 (small)
+        np.testing.assert_allclose(float(incremental), 0.01, atol=1e-5)
+
+    def test_transition_saturation(self):
+        comp = BassTrend()
+        carry = jnp.array([99.9, 0.0])
+        inn = {"inn": jnp.array(0.0), "obs_cumulative": jnp.array(99.9)}
+        params = {"p": jnp.array(0.05), "q": jnp.array(0.3), "M": jnp.array(100.0)}
+        _, incremental = comp.transition_fn(carry, inn, params)
+        # remaining ≈ 0.1, so incremental is very small
+        assert float(incremental) < 0.1
+
+    def test_forecast_from_state_shape(self):
+        comp = BassTrend()
+        state = jnp.array([0.5, 0.1])
+        params = {"p": jnp.array(0.05), "q": jnp.array(0.3), "M": jnp.array(1.0)}
+        levels = comp.forecast_from_state(state, params, 12, jr.PRNGKey(0))
+        assert levels.shape == (12,)
+
+    def test_forecast_autoregressive_cumulates(self):
+        comp = BassTrend()
+        state = jnp.array([0.0, 0.0])
+        params = {"p": jnp.array(0.05), "q": jnp.array(0.3), "M": jnp.array(10.0)}
+        levels = comp.forecast_from_state(state, params, 30, jr.PRNGKey(42))
+        # Cumulative sum of incremental should grow
+        cum = jnp.cumsum(levels)
+        assert float(cum[-1]) > float(cum[0])
+        # Should not exceed M
+        assert float(cum[-1]) <= 10.0 + 0.5  # small noise tolerance
+
+    def test_state_dim(self):
+        assert BassTrend().state_dim == 2
+
+    def test_serialization_roundtrip(self):
+        comp = BassTrend()
+        d = comp.to_dict()
+        assert d["type"] == "bass_diffusion"
+        assert d["params"]["p_prior"] == (1.0, 19.0)
+        assert d["params"]["q_prior"] == (2.0, 5.0)
+        assert d["params"]["M_prior"] == (0.0, 1.0)
+        comp2 = TrendComponent.from_dict(d)
+        assert isinstance(comp2, BassTrend)
+        assert comp2.p_prior == (1.0, 19.0)
+
+    def test_serialization_roundtrip_custom_priors(self):
+        comp = BassTrend(p_prior=(3.0, 57.0), q_prior=(10.0, 20.0), M_prior=(1.5, 0.3))
+        d = comp.to_dict()
+        comp2 = TrendComponent.from_dict(d)
+        assert isinstance(comp2, BassTrend)
+        assert comp2.p_prior == (3.0, 57.0)
+        assert comp2.q_prior == (10.0, 20.0)
+        assert comp2.M_prior == (1.5, 0.3)
+
+    def test_custom_priors_affect_sampling(self):
+        # Tight prior on p centered at 0.5 (very different from default 0.05)
+        comp = BassTrend(p_prior=(50.0, 50.0))  # Beta(50,50) → mean=0.5, tight
+
+        def model():
+            params = comp.sample_params("test")
+            return params["p"]
+
+        with numpyro.handlers.seed(rng_seed=0):
+            p_val = model()
+        # Should be near 0.5, not 0.05
+        assert float(p_val) > 0.3
+
+    def test_from_posterior(self):
+        # Simulate posterior samples
+        rng = np.random.default_rng(42)
+        samples = {
+            "bass_p_GEN2": rng.beta(2, 38, size=100),   # mean ~0.05
+            "bass_q_GEN2": rng.beta(7, 14, size=100),   # mean ~0.33
+            "bass_M_GEN2": rng.lognormal(0.5, 0.3, size=100),
+        }
+        comp = BassTrend.from_posterior(samples, "GEN2")
+        assert isinstance(comp, BassTrend)
+        # p prior should be centered near 0.05
+        p_mean = comp.p_prior[0] / (comp.p_prior[0] + comp.p_prior[1])
+        assert 0.02 < p_mean < 0.10
+        # q prior should be centered near 0.33
+        q_mean = comp.q_prior[0] / (comp.q_prior[0] + comp.q_prior[1])
+        assert 0.20 < q_mean < 0.50
+
+    def test_from_posterior_with_M_override(self):
+        rng = np.random.default_rng(0)
+        samples = {
+            "bass_p_old": rng.beta(2, 38, size=50),
+            "bass_q_old": rng.beta(7, 14, size=50),
+            "bass_M_old": rng.lognormal(0, 0.5, size=50),
+        }
+        comp = BassTrend.from_posterior(samples, "old", M_prior=(2.0, 0.2))
+        assert comp.M_prior == (2.0, 0.2)
+
+    def test_beta_moment_match(self):
+        alpha, beta = BassTrend._beta_moment_match(np.array([0.04, 0.05, 0.06, 0.05, 0.04]))
+        mean = alpha / (alpha + beta)
+        assert 0.04 < mean < 0.06
+
+    def test_lognormal_moment_match(self):
+        mu, sigma = BassTrend._lognormal_moment_match(np.array([1.0, 1.1, 0.9, 1.05, 0.95]))
+        # mu should be near log(1.0) ≈ 0
+        assert -0.5 < mu < 0.5
+        assert sigma > 0
+
+    def test_inject_data(self):
+        comp = BassTrend()
+        y = jnp.array([1.0, 2.0, 3.0, 4.0])
+        result = comp.inject_data(y, T=4, horizon=0)
+        assert "obs_cumulative" in result
+        # obs_cumulative[0] = 0, obs_cumulative[1] = cumsum(y)[0] = 1, etc.
+        expected = jnp.array([0.0, 1.0, 3.0, 6.0])
+        np.testing.assert_allclose(np.asarray(result["obs_cumulative"]), np.asarray(expected), atol=1e-5)
+
+    def test_inject_data_with_horizon(self):
+        comp = BassTrend()
+        y = jnp.array([1.0, 2.0])
+        result = comp.inject_data(y, T=2, horizon=3)
+        assert result["obs_cumulative"].shape == (5,)
+        # Last 3 should be zeros (forecast period)
+        np.testing.assert_allclose(np.asarray(result["obs_cumulative"][2:]), [0.0, 0.0, 0.0])
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +698,9 @@ class TestRegistry:
         assert "local_linear_trend" in reg
         assert "damped_local_linear_trend" in reg
         assert "ou_mean_reversion" in reg
+        assert "bass_diffusion" in reg
         assert reg["local_linear_trend"] is LocalLinearTrend
+        assert reg["bass_diffusion"] is BassTrend
 
     def test_seasonality_registry(self):
         reg = SeasonalityComponent._registry
@@ -662,3 +838,146 @@ class TestComponentLibrary:
         lib = ComponentLibrary.all_components()
         llt = lib["local_linear_trend"]
         assert llt["params"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Batched scan tests
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedScan:
+    """Test that batched_scan produces results matching sequential scan."""
+
+    def _run_batched_vs_sequential(self, comp_cls, make_params, make_innovations, make_init):
+        """Generic helper: compare batched scan output to per-node sequential scan."""
+        N = 3
+        total_T = 24
+        group = []
+        for i in range(N):
+
+            def model(i=i):
+                params = make_params(f"node_{i}")
+                innovations = make_innovations(f"node_{i}", total_T)
+                init = make_init(params)
+                return params, innovations, init
+
+            with numpyro.handlers.seed(rng_seed=i):
+                params, innovations, init = model()
+            group.append((i, f"node_{i}", params, innovations, init))
+
+        comp = comp_cls()
+        batched_results = comp.batched_scan(group, total_T)
+
+        # Verify each node matches a sequential scan
+        for g in group:
+            idx, node_key, params, all_innovations, init = g
+            b_carry, b_levels = batched_results[idx]
+
+            # Sequential scan
+            def scan_fn(carry, t_idx):
+                inn_t = {k: v[t_idx] for k, v in all_innovations.items()}
+                new_carry, level_t = comp.transition_fn(carry, inn_t, params)
+                return new_carry, level_t
+
+            s_carry, s_levels = jax.lax.scan(scan_fn, init, jnp.arange(total_T))
+
+            np.testing.assert_allclose(
+                np.asarray(b_carry), np.asarray(s_carry), atol=1e-4,
+                err_msg=f"Carry mismatch for node {idx}",
+            )
+            np.testing.assert_allclose(
+                np.asarray(b_levels), np.asarray(s_levels), atol=1e-4,
+                err_msg=f"Levels mismatch for node {idx}",
+            )
+
+    def test_llt_batched_matches_sequential(self):
+        def make_params(key):
+            return {
+                "level_sigma": jnp.array(0.1),
+                "slope_sigma": jnp.array(0.01),
+                "level_init": jnp.array(0.0),
+                "slope_init": jnp.array(0.05),
+            }
+        def make_innovations(key, T):
+            k = jr.PRNGKey(hash(key) % 2**31)
+            k1, k2 = jr.split(k)
+            return {"lev_inn": jr.normal(k1, (T,)), "slp_inn": jr.normal(k2, (T,))}
+        def make_init(params):
+            return jnp.array([params["level_init"], params["slope_init"]])
+
+        self._run_batched_vs_sequential(
+            LocalLinearTrend, make_params, make_innovations, make_init,
+        )
+
+    def test_dllt_batched_matches_sequential(self):
+        def make_params(key):
+            return {
+                "level_sigma": jnp.array(0.1),
+                "slope_sigma": jnp.array(0.01),
+                "level_init": jnp.array(0.0),
+                "slope_init": jnp.array(0.05),
+                "phi": jnp.array(0.9),
+            }
+        def make_innovations(key, T):
+            k = jr.PRNGKey(hash(key) % 2**31)
+            k1, k2 = jr.split(k)
+            return {"lev_inn": jr.normal(k1, (T,)), "slp_inn": jr.normal(k2, (T,))}
+        def make_init(params):
+            return jnp.array([params["level_init"], params["slope_init"]])
+
+        self._run_batched_vs_sequential(
+            DampedLocalLinearTrend, make_params, make_innovations, make_init,
+        )
+
+    def test_ou_batched_matches_sequential(self):
+        def make_params(key):
+            return {
+                "theta": jnp.array(0.3),
+                "mu": jnp.array(0.0),
+                "sigma": jnp.array(0.1),
+                "level_init": jnp.array(1.0),
+            }
+        def make_innovations(key, T):
+            k = jr.PRNGKey(hash(key) % 2**31)
+            return {"inn": jr.normal(k, (T,))}
+        def make_init(params):
+            return jnp.array([params["level_init"]])
+
+        self._run_batched_vs_sequential(
+            OUMeanReversion, make_params, make_innovations, make_init,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Auto-regression via resolve_components
+# ---------------------------------------------------------------------------
+
+
+class TestResolveComponentsAutoRegression:
+    def test_auto_regression_with_edges(self):
+        """When predictor_edges are given, ExternalRegression is auto-appended."""
+        cfg = NodeConfig()
+        comps = resolve_components(cfg, predictor_edges=["edge1"])
+        assert any(isinstance(c, ExternalRegression) for c in comps)
+        assert len(comps) == 2  # LLT + ExternalRegression
+
+    def test_no_double_regression(self):
+        """If RegressionComponent already present, don't add another."""
+        cfg = NodeConfig(components=(LocalLinearTrend(), ExternalRegression()))
+        comps = resolve_components(cfg, predictor_edges=["edge1"])
+        reg_count = sum(1 for c in comps if isinstance(c, ExternalRegression))
+        assert reg_count == 1
+
+    def test_backward_compatible(self):
+        """No edges → no regression added (backward compatibility)."""
+        cfg = NodeConfig()
+        comps = resolve_components(cfg)
+        assert len(comps) == 1
+        assert isinstance(comps[0], LocalLinearTrend)
+
+    def test_no_regression_with_empty_edges(self):
+        """Empty list → no regression added."""
+        cfg = NodeConfig()
+        comps = resolve_components(cfg, predictor_edges=[])
+        assert len(comps) == 1
+        assert isinstance(comps[0], LocalLinearTrend)

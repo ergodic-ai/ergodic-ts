@@ -85,3 +85,4 @@ nav:
       - Query Snowflake: examples/query_snowflake.md
       - Create Table: examples/create_table.md
       - Reducer: examples/reducer.md
+      - Harmonizer: examples/harmonizer.md

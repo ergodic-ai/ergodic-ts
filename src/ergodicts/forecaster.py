@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -16,8 +17,6 @@ from numpyro.infer.autoguide import AutoNormal
 
 from ergodicts.causal_dag import CausalDAG, EdgeSpec, ExternalNode, NodeConfig
 from ergodicts.components import (
-    Component,
-    ExternalRegression,
     RegressionComponent,
     SeasonalityComponent,
     TrendComponent,
@@ -285,73 +284,197 @@ def _build_node_predictors(
     return jnp.stack(cols, axis=-1)  # (total_T, n_edges)
 
 
-# ---------------------------------------------------------------------------
-# NumPyro model (component-based)
-# ---------------------------------------------------------------------------
+def _build_future_predictors(
+    x_hist_dict: dict[ExternalNode, jnp.ndarray],
+    horizon: int,
+    x_future: dict[ExternalNode, np.ndarray] | None,
+    rng_key: jax.Array | None = None,
+    *,
+    in_model: bool = False,
+) -> dict[ExternalNode, jnp.ndarray]:
+    """Build full-length external predictor arrays (hist + future).
 
+    Parameters
+    ----------
+    x_hist_dict
+        Historical predictor arrays from ``ForecastData.x``.
+    horizon
+        Forecast horizon (0 during training-only).
+    x_future
+        User-supplied future values; overrides random walk when given.
+    rng_key
+        JAX PRNG key (used when ``in_model=False``).
+    in_model
+        If True, uses ``numpyro.sample`` for the random walk extension
+        (called inside ``_forecaster_model``).  If False, uses
+        ``jax.random`` (called from ``_forecast_core``).
 
-# ---------------------------------------------------------------------------
-# Batched scan helpers — vectorize trend scans across nodes of the same type
-# ---------------------------------------------------------------------------
-
-
-def _llt_transition(carry, inn_t, level_sigma, slope_sigma):
-    """Single-step LocalLinearTrend transition (vmappable)."""
-    level, slope = carry[0], carry[1]
-    new_level = level + slope + level_sigma * inn_t[0]
-    new_slope = slope + slope_sigma * inn_t[1]
-    return jnp.array([new_level, new_slope]), new_level
-
-
-def _dllt_transition(carry, inn_t, level_sigma, slope_sigma, phi):
-    """Single-step DampedLocalLinearTrend transition (vmappable)."""
-    level, slope = carry[0], carry[1]
-    new_level = level + slope + level_sigma * inn_t[0]
-    new_slope = phi * slope + slope_sigma * inn_t[1]
-    return jnp.array([new_level, new_slope]), new_level
-
-
-def _ou_transition(carry, inn_t, theta, mu, sigma):
-    """Single-step OUMeanReversion transition (vmappable)."""
-    level = carry[0]
-    new_level = level + theta * (mu - level) + sigma * inn_t[0]
-    return jnp.array([new_level]), new_level
-
-
-def _batched_llt_scan(inits, innovations, level_sigmas, slope_sigmas, total_T):
-    """Run LLT scan batched over N nodes via vmap.
-
-    Parameters: inits (N, 2), innovations (N, total_T, 2),
-    level_sigmas (N,), slope_sigmas (N,).
-
-    Returns: final_carries (N, 2), all_levels (N, total_T).
+    Returns
+    -------
+    dict mapping each external node to its full-length array.
     """
-    def _single_scan(init, inns, lsig, ssig):
-        def step(carry, inn_t):
-            return _llt_transition(carry, inn_t, lsig, ssig)
-        return jax.lax.scan(step, init, inns)
+    x_full: dict[ExternalNode, jnp.ndarray] = {}
+    for ext, x_hist in x_hist_dict.items():
+        if horizon > 0 and x_future and ext in x_future:
+            if in_model:
+                x_full[ext] = jnp.concatenate([x_hist, x_future[ext]])
+            else:
+                x_full[ext] = jnp.array(
+                    x_future[ext][:horizon], dtype=jnp.float32,
+                )
+        elif horizon > 0:
+            if in_model:
+                ext_sigma = numpyro.sample(
+                    f"ext_sigma_{ext}", dist.HalfNormal(0.1),
+                )
+                ext_inn = numpyro.sample(
+                    f"ext_inn_{ext}", dist.Normal(0, 1).expand([horizon]),
+                )
+                last_val = x_hist[-1]
+                future = last_val + jnp.cumsum(ext_sigma * ext_inn)
+                x_full[ext] = jnp.concatenate([x_hist, future])
+            else:
+                k1, rng_key = jr.split(rng_key)
+                inn = jr.normal(k1, (horizon,))
+                x_full[ext] = x_hist[-1] + jnp.cumsum(0.1 * inn)
+        else:
+            x_full[ext] = x_hist
+    return x_full
 
-    return jax.vmap(_single_scan)(inits, innovations, level_sigmas, slope_sigmas)
+
+def _build_node_future_X(
+    edges: list[EdgeSpec],
+    x_hist: dict[ExternalNode, jnp.ndarray],
+    x_fut: dict[ExternalNode, jnp.ndarray],
+    T: int,
+    horizon: int,
+) -> tuple[jnp.ndarray, list[str]]:
+    """Build the per-node regression predictor matrix for the forecast path.
+
+    Returns ``(X_future, edge_names)`` where ``X_future`` has shape
+    ``(horizon, n_edges)``.
+    """
+    x_cols: list[jnp.ndarray] = []
+    edge_names: list[str] = []
+    for edge in edges:
+        src = edge.source
+        if not isinstance(src, ExternalNode):
+            x_cols.append(jnp.zeros(horizon))
+            edge_names.append(str(src))
+            continue
+        edge_names.append(src.name)
+        lag = edge.lag
+        x_hist_arr = x_hist[src]
+        if src in x_fut:
+            x_extended = jnp.concatenate([x_hist_arr, x_fut[src]])
+        else:
+            x_extended = x_hist_arr
+        x_fc = x_extended[T - lag: T - lag + horizon]
+        x_cols.append(x_fc)
+    X_future = jnp.stack(x_cols, axis=-1) if x_cols else jnp.zeros((horizon, 0))
+    return X_future, edge_names
 
 
-def _batched_dllt_scan(inits, innovations, level_sigmas, slope_sigmas, phis, total_T):
-    """Run DampedLLT scan batched over N nodes via vmap."""
-    def _single_scan(init, inns, lsig, ssig, phi):
-        def step(carry, inn_t):
-            return _dllt_transition(carry, inn_t, lsig, ssig, phi)
-        return jax.lax.scan(step, init, inns)
 
-    return jax.vmap(_single_scan)(inits, innovations, level_sigmas, slope_sigmas, phis)
+# ---------------------------------------------------------------------------
+# Reconciliation strategies
+# ---------------------------------------------------------------------------
 
 
-def _batched_ou_scan(inits, innovations, thetas, mus, sigmas, total_T):
-    """Run OU scan batched over N nodes via vmap."""
-    def _single_scan(init, inns, theta, mu, sigma):
-        def step(carry, inn_t):
-            return _ou_transition(carry, inn_t, theta, mu, sigma)
-        return jax.lax.scan(step, init, inns)
+class ReconciliationStrategy(ABC):
+    """Strategy for reconciling leaf-node forecasts with root aggregates."""
 
-    return jax.vmap(_single_scan)(inits, innovations, thetas, mus, sigmas)
+    @abstractmethod
+    def reconcile_model(
+        self,
+        all_mus: jnp.ndarray,
+        data: ForecastData,
+        T: int,
+        total_T: int,
+    ) -> None:
+        """Apply reconciliation inside the NumPyro model.
+
+        Parameters
+        ----------
+        all_mus
+            Stacked leaf-node means ``(total_T, N)``.
+        data
+            Forecast data (for ``root_nodes``, ``children_map``, ``y``).
+        T
+            Historical time steps.
+        total_T
+            Total time steps (``T + horizon``).
+        """
+
+    @abstractmethod
+    def reconcile_forecast(
+        self,
+        leaf_results: dict[ModelKey, np.ndarray],
+        data: ForecastData,
+    ) -> dict[ModelKey, np.ndarray]:
+        """Reconcile forecast results (post-inference).
+
+        Returns the updated results dict with root nodes added.
+        """
+
+
+class BottomUpReconciliation(ReconciliationStrategy):
+    """Root = deterministic sum of leaves."""
+
+    def reconcile_model(self, all_mus, data, T, total_T):
+        total_mu = jnp.sum(all_mus, axis=-1)  # (total_T,)
+        for root in data.root_nodes:
+            if root in data.y:
+                root_sigma = numpyro.sample(
+                    f"obs_sigma_{root}", dist.HalfNormal(1.0),
+                )
+                numpyro.sample(
+                    f"y_{root}",
+                    dist.Normal(total_mu[:T], root_sigma),
+                    obs=data.y[root],
+                )
+            numpyro.deterministic(f"mu_{root}", total_mu)
+
+    def reconcile_forecast(self, leaf_results, data):
+        results = dict(leaf_results)
+        for root in data.root_nodes:
+            results[root] = sum(results[k] for k in data.children_map[root])
+        return results
+
+
+class SoftReconciliation(ReconciliationStrategy):
+    """Soft reconciliation (same as bottom-up for now)."""
+
+    def reconcile_model(self, all_mus, data, T, total_T):
+        BottomUpReconciliation().reconcile_model(all_mus, data, T, total_T)
+
+    def reconcile_forecast(self, leaf_results, data):
+        return BottomUpReconciliation().reconcile_forecast(leaf_results, data)
+
+
+class NoReconciliation(ReconciliationStrategy):
+    """No reconciliation — root nodes are not produced."""
+
+    def reconcile_model(self, all_mus, data, T, total_T):
+        pass
+
+    def reconcile_forecast(self, leaf_results, data):
+        return leaf_results
+
+
+def _get_reconciler(name: str) -> ReconciliationStrategy:
+    """Factory: return a reconciliation strategy by name."""
+    strategies: dict[str, ReconciliationStrategy] = {
+        "bottom_up": BottomUpReconciliation(),
+        "soft": SoftReconciliation(),
+        "none": NoReconciliation(),
+    }
+    if name not in strategies:
+        raise ValueError(
+            f"Unknown reconciliation: {name!r}. "
+            f"Available: {sorted(strategies)}"
+        )
+    return strategies[name]
 
 
 # ---------------------------------------------------------------------------
@@ -379,22 +502,9 @@ def _forecaster_model(
     N = len(leaf_nodes)
 
     # --- Extend external predictors for forecast horizon -----------------
-    x_full: dict[ExternalNode, jnp.ndarray] = {}
-    for ext, x_hist in data.x.items():
-        if horizon > 0 and x_future and ext in x_future:
-            x_full[ext] = jnp.concatenate([x_hist, x_future[ext]])
-        elif horizon > 0:
-            ext_sigma = numpyro.sample(
-                f"ext_sigma_{ext}", dist.HalfNormal(0.1),
-            )
-            ext_inn = numpyro.sample(
-                f"ext_inn_{ext}", dist.Normal(0, 1).expand([horizon]),
-            )
-            last_val = x_hist[-1]
-            future = last_val + jnp.cumsum(ext_sigma * ext_inn)
-            x_full[ext] = jnp.concatenate([x_hist, future])
-        else:
-            x_full[ext] = x_hist
+    x_full = _build_future_predictors(
+        data.x, horizon, x_future, rng_key=None, in_model=True,
+    )
 
     # =====================================================================
     # Phase 1: Sample all numpyro sites per-node (Python loop)
@@ -414,7 +524,8 @@ def _forecaster_model(
     for i, k in enumerate(leaf_nodes):
         cfg = node_configs.get(k, NodeConfig())
         node_key = str(k)
-        components = resolve_components(cfg)
+        edges = data.predictor_edges.get(k, [])
+        components = resolve_components(cfg, predictor_edges=edges or None)
         agg = resolve_aggregator(cfg)
         node_aggs[i] = agg
 
@@ -423,7 +534,6 @@ def _forecaster_model(
         )
 
         for comp in components:
-            role = component_role(comp)
             if isinstance(comp, TrendComponent):
                 # Sample params and innovations
                 params = comp.sample_params(node_key)
@@ -440,8 +550,12 @@ def _forecaster_model(
                 else:
                     all_innovations = innovations_hist
 
+                # Inject data-derived innovations (e.g. teacher-forcing)
+                injected = comp.inject_data(data.y[k], T, horizon)
+                all_innovations.update(injected)
+
                 init = comp.init_state(params)
-                trend_type = comp.component_name  # "local_linear_trend", "damped_local_linear_trend", "ou_mean_reversion"
+                trend_type = comp.component_name
                 trend_groups.setdefault(trend_type, []).append(
                     (i, node_key, params, all_innovations, init)
                 )
@@ -451,14 +565,11 @@ def _forecaster_model(
                 seasonal = comp.contribute(params, total_T)
                 seasonal_contribs.setdefault(i, []).append(seasonal)
 
-        # Regression (from DAG edges)
-        edges = data.predictor_edges.get(k, [])
-        if edges:
-            reg_comp = ExternalRegression()
-            X_node = _build_node_predictors(edges, x_full, total_T)
-            reg_params = reg_comp.sample_params(node_key, len(edges))
-            reg_contrib = reg_comp.contribute(reg_params, X_node)
-            regression_contribs[i] = reg_contrib
+            elif isinstance(comp, RegressionComponent):
+                X_node = _build_node_predictors(edges, x_full, total_T)
+                reg_params = comp.sample_params(node_key, len(edges))
+                reg_contrib = comp.contribute(reg_params, X_node)
+                regression_contribs[i] = reg_contrib
 
     # =====================================================================
     # Phase 2: Batched trend scans (one vmap per trend type)
@@ -467,86 +578,17 @@ def _forecaster_model(
     trend_results: dict[int, tuple[jnp.ndarray, jnp.ndarray]] = {}
 
     for trend_type, group in trend_groups.items():
-        indices = [g[0] for g in group]
-        node_keys = [g[1] for g in group]
-
-        if trend_type == "local_linear_trend":
-            # Stack params
-            level_sigmas = jnp.stack([g[2]["level_sigma"] for g in group])
-            slope_sigmas = jnp.stack([g[2]["slope_sigma"] for g in group])
-            # Stack innovations: (N, total_T, 2) — [lev_inn, slp_inn]
-            inns = jnp.stack([
-                jnp.stack([g[3]["lev_inn"], g[3]["slp_inn"]], axis=-1)
-                for g in group
-            ])
-            inits = jnp.stack([g[4] for g in group])
-
-            final_carries, all_levels = _batched_llt_scan(
-                inits, inns, level_sigmas, slope_sigmas, total_T,
-            )
-            for j, idx in enumerate(indices):
-                trend_results[idx] = (final_carries[j], all_levels[j])
-
-        elif trend_type == "damped_local_linear_trend":
-            level_sigmas = jnp.stack([g[2]["level_sigma"] for g in group])
-            slope_sigmas = jnp.stack([g[2]["slope_sigma"] for g in group])
-            phis = jnp.stack([g[2]["phi"] for g in group])
-            inns = jnp.stack([
-                jnp.stack([g[3]["lev_inn"], g[3]["slp_inn"]], axis=-1)
-                for g in group
-            ])
-            inits = jnp.stack([g[4] for g in group])
-
-            final_carries, all_levels = _batched_dllt_scan(
-                inits, inns, level_sigmas, slope_sigmas, phis, total_T,
-            )
-            for j, idx in enumerate(indices):
-                trend_results[idx] = (final_carries[j], all_levels[j])
-
-        elif trend_type == "ou_mean_reversion":
-            thetas = jnp.stack([g[2]["theta"] for g in group])
-            mus = jnp.stack([g[2]["mu"] for g in group])
-            sigmas = jnp.stack([g[2]["sigma"] for g in group])
-            inns = jnp.stack([
-                g[3]["inn"][:, None]  # (total_T, 1)
-                for g in group
-            ])
-            inits = jnp.stack([g[4] for g in group])
-
-            final_carries, all_levels = _batched_ou_scan(
-                inits, inns, thetas, mus, sigmas, total_T,
-            )
-            for j, idx in enumerate(indices):
-                trend_results[idx] = (final_carries[j], all_levels[j])
-
-        else:
-            # Fallback: per-node scan for unknown trend types
-            for g in group:
-                idx, node_key, params, all_innovations, init = g
-                comp_instance = resolve_components(
-                    node_configs.get(leaf_nodes[idx], NodeConfig())
-                )[0]
-
-                def _make_scan_fn(component, parameters, innovations):
-                    def scan_fn(carry, t_idx):
-                        inn_t = {
-                            inn_key: all_inn[t_idx]
-                            for inn_key, all_inn in innovations.items()
-                        }
-                        new_carry, level_t = component.transition_fn(carry, inn_t, parameters)
-                        return new_carry, level_t
-                    return scan_fn
-
-                scan_fn = _make_scan_fn(comp_instance, params, all_innovations)
-                final_carry, levels = jax.lax.scan(
-                    scan_fn, init, jnp.arange(total_T),
-                )
-                trend_results[idx] = (final_carry, levels)
+        # Find a representative component instance for this trend type
+        representative = next(
+            c for c in resolve_components(
+                node_configs.get(leaf_nodes[group[0][0]], NodeConfig())
+            ) if isinstance(c, TrendComponent)
+        )
+        trend_results.update(representative.batched_scan(group, total_T))
 
         # Register deterministic final_state sites
         for g in group:
-            idx, node_key = g[0], g[1]
-            numpyro.deterministic(f"final_state_{node_key}", trend_results[idx][0])
+            numpyro.deterministic(f"final_state_{g[1]}", trend_results[g[0]][0])
 
     # =====================================================================
     # Phase 3: Aggregate contributions per node
@@ -575,11 +617,6 @@ def _forecaster_model(
     # Stack all node means: (total_T, N)
     all_mus = jnp.stack(all_mus_list, axis=-1)
 
-    # --- Root = sum of leaves (for bottom_up and soft) --------------------
-    has_root = reconciliation in ("bottom_up", "soft") and root_nodes
-    if has_root:
-        total_mu = jnp.sum(all_mus, axis=-1)  # (total_T,)
-
     # --- Observations (historical only) ----------------------------------
     for i, k in enumerate(leaf_nodes):
         numpyro.sample(
@@ -588,24 +625,14 @@ def _forecaster_model(
             obs=data.y[k],
         )
 
-    if has_root:
-        for root in root_nodes:
-            if root in data.y:
-                root_sigma = numpyro.sample(
-                    f"obs_sigma_{root}", dist.HalfNormal(1.0),
-                )
-                numpyro.sample(
-                    f"y_{root}",
-                    dist.Normal(total_mu[:T], root_sigma),
-                    obs=data.y[root],
-                )
+    # --- Reconciliation ---------------------------------------------------
+    reconciler = _get_reconciler(reconciliation)
+    if root_nodes:
+        reconciler.reconcile_model(all_mus, data, T, total_T)
 
     # --- Deterministic forecast outputs ----------------------------------
     for i, k in enumerate(leaf_nodes):
         numpyro.deterministic(f"mu_{k}", all_mus[:, i])
-    if has_root:
-        for root in root_nodes:
-            numpyro.deterministic(f"mu_{root}", total_mu)
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +792,157 @@ class HierarchicalForecaster:
 
         return self
 
+    def _forecast_core(
+        self,
+        horizon: int,
+        x_future: dict[ExternalNode, np.ndarray] | None,
+        rng_seed: int,
+        decompose: bool,
+    ) -> tuple[dict[ModelKey, np.ndarray], Decomposition | None]:
+        """Shared forecast implementation.
+
+        When *decompose* is True, also collects per-component contributions
+        and returns a :class:`Decomposition`.
+        """
+        if self._samples is None or self._data is None:
+            raise RuntimeError("Must call .fit() before forecasting")
+
+        data = self._data
+        leaf_nodes = data.leaf_nodes
+        T = data.T
+        samples = self._samples
+
+        num_samp = samples[f"obs_sigma_{leaf_nodes[0]}"].shape[0]
+        rng_key = jr.PRNGKey(rng_seed)
+
+        # --- Build future external predictor values ----------------------
+        has_predictors = any(data.predictor_edges.get(k, []) for k in leaf_nodes)
+        if has_predictors:
+            k_pred, rng_key = jr.split(rng_key)
+            x_fut = _build_future_predictors(
+                data.x, horizon, x_future, k_pred, in_model=False,
+            )
+        else:
+            x_fut: dict[ExternalNode, jnp.ndarray] = {}
+
+        # --- Decomposition collectors (only when decompose=True) ---------
+        decomp_contribs: dict[ModelKey, dict[str, np.ndarray]] = {}
+        decomp_reg_coeffs: dict[ModelKey, dict[str, np.ndarray]] = {}
+        decomp_agg_type: dict[ModelKey, str] = {}
+
+        # --- Per-node forecast -------------------------------------------
+        forecast_per_node: list[jnp.ndarray] = []
+
+        for i, k in enumerate(leaf_nodes):
+            cfg = self.node_configs.get(k, NodeConfig())
+            node_key = str(k)
+            edges = data.predictor_edges.get(k, [])
+            components = resolve_components(cfg, predictor_edges=edges or None)
+            agg = resolve_aggregator(cfg)
+
+            contributions: dict[str, list[jnp.ndarray]] = {}
+
+            if decompose:
+                decomp_agg_type[k] = agg.component_name
+                node_decomp: dict[str, np.ndarray] = {}
+
+            for comp in components:
+                role = component_role(comp)
+                if isinstance(comp, TrendComponent):
+                    post_params = comp.extract_posterior(node_key, samples)
+                    final_state = samples[f"final_state_{node_key}"]
+
+                    k1, rng_key = jr.split(rng_key)
+                    rng_keys = jr.split(k1, num_samp)
+
+                    trend_levels = jax.vmap(
+                        lambda fs, rk, *p_vals: comp.forecast_from_state(
+                            fs,
+                            dict(zip(post_params.keys(), p_vals)),
+                            horizon,
+                            rk,
+                        ),
+                    )(final_state, rng_keys, *post_params.values())
+                    contributions.setdefault(role, []).append(trend_levels)
+
+                    if decompose:
+                        node_decomp[f"trend_{comp.component_name}"] = np.asarray(trend_levels)
+
+                elif isinstance(comp, SeasonalityComponent):
+                    post_params = comp.extract_posterior(node_key, samples)
+
+                    seasonal = jax.vmap(
+                        lambda *p_vals: comp.forecast_contribute(
+                            dict(zip(post_params.keys(), p_vals)),
+                            T,
+                            horizon,
+                        ),
+                    )(*post_params.values())
+                    contributions.setdefault(role, []).append(seasonal)
+
+                    if decompose:
+                        node_decomp[f"seasonality_{comp.component_name}"] = np.asarray(seasonal)
+
+                elif isinstance(comp, RegressionComponent):
+                    reg_post = comp.extract_posterior(node_key, samples)
+
+                    X_future_node, edge_names = _build_node_future_X(
+                        edges, data.x, x_fut, T, horizon,
+                    )
+                    reg_forecast = jax.vmap(
+                        lambda *p_vals: comp.forecast_contribute(
+                            dict(zip(reg_post.keys(), p_vals)),
+                            X_future_node,
+                        ),
+                    )(*reg_post.values())
+                    contributions.setdefault(role, []).append(reg_forecast)
+
+                    if decompose:
+                        node_decomp["regression_total"] = np.asarray(reg_forecast)
+                        betas = np.asarray(reg_post["betas"])
+                        reg_coeffs: dict[str, np.ndarray] = {}
+                        for j, ename in enumerate(edge_names):
+                            attr = betas[:, j:j+1] * np.asarray(X_future_node[:, j])[None, :]
+                            node_decomp[f"regression_{ename}"] = attr
+                            reg_coeffs[ename] = betas[:, j]
+                        decomp_reg_coeffs[k] = reg_coeffs
+
+            if decompose:
+                decomp_contribs[k] = node_decomp
+
+            node_forecast = agg.aggregate(contributions, (num_samp, horizon))
+            forecast_per_node.append(node_forecast)
+
+        # --- Stack: (S, horizon, N) and add obs noise --------------------
+        forecast_stack = jnp.stack(forecast_per_node, axis=-1)
+        obs_sigma_arr = jnp.stack(
+            [samples[f"obs_sigma_{k}"] for k in leaf_nodes], axis=-1,
+        )
+        k3, rng_key = jr.split(rng_key)
+        obs_noise = jr.normal(k3, forecast_stack.shape) * obs_sigma_arr[:, None, :]
+        forecast_samples = forecast_stack + obs_noise
+
+        # --- Extract per-node and unstandardise ---------------------------
+        results: dict[ModelKey, np.ndarray] = {}
+        for i, k in enumerate(leaf_nodes):
+            raw = np.asarray(forecast_samples[:, :, i])
+            results[k] = data.unstandardize(k, raw)
+
+        # --- Reconciliation ---------------------------------------------------
+        if data.root_nodes:
+            reconciler = _get_reconciler(self.reconciliation)
+            results = reconciler.reconcile_forecast(results, data)
+
+        if decompose:
+            decomposition = Decomposition(
+                contributions=decomp_contribs,
+                regression_coefficients=decomp_reg_coeffs,
+                aggregator_type=decomp_agg_type,
+            )
+            return results, decomposition
+
+        return results, None
+
     def forecast(
         self,
         horizon: int,
@@ -791,136 +969,7 @@ class HierarchicalForecaster:
             ``(num_samples, horizon)`` per node, on the **original**
             (unstandardised) scale.
         """
-        if self._samples is None or self._data is None:
-            raise RuntimeError("Must call .fit() before .forecast()")
-
-        data = self._data
-        leaf_nodes = data.leaf_nodes
-        N = len(leaf_nodes)
-        T = data.T
-        samples = self._samples
-
-        # Infer num_samples from obs_sigma (always present)
-        num_samp = samples[f"obs_sigma_{leaf_nodes[0]}"].shape[0]
-
-        rng_key = jr.PRNGKey(rng_seed)
-
-        # --- Build future external predictor values ----------------------
-        x_fut: dict[ExternalNode, jnp.ndarray] = {}
-        if any(data.predictor_edges.get(k, []) for k in leaf_nodes):
-            for ext, x_hist in data.x.items():
-                if x_future and ext in x_future:
-                    x_fut[ext] = jnp.array(
-                        x_future[ext][:horizon], dtype=jnp.float32,
-                    )
-                else:
-                    k1, rng_key = jr.split(rng_key)
-                    inn = jr.normal(k1, (horizon,))
-                    x_fut[ext] = x_hist[-1] + jnp.cumsum(0.1 * inn)
-
-        # --- Per-node forecast -------------------------------------------
-        forecast_per_node: list[jnp.ndarray] = []  # (S, horizon) per node
-
-        for i, k in enumerate(leaf_nodes):
-            cfg = self.node_configs.get(k, NodeConfig())
-            node_key = str(k)
-            components = resolve_components(cfg)
-            agg = resolve_aggregator(cfg)
-
-            contributions: dict[str, list[jnp.ndarray]] = {}
-
-            for comp in components:
-                role = component_role(comp)
-                if isinstance(comp, TrendComponent):
-                    # Extract posterior params
-                    post_params = comp.extract_posterior(node_key, samples)
-                    final_state_key = f"final_state_{node_key}"
-                    final_state = samples[final_state_key]  # (S, state_dim)
-
-                    # Forecast: vmap over sample dimension
-                    k1, rng_key = jr.split(rng_key)
-                    rng_keys = jr.split(k1, num_samp)
-
-                    # Build per-sample param dict for vmap
-                    trend_levels = jax.vmap(
-                        lambda fs, rk, *p_vals: comp.forecast_from_state(
-                            fs,
-                            dict(zip(post_params.keys(), p_vals)),
-                            horizon,
-                            rk,
-                        ),
-                    )(final_state, rng_keys, *post_params.values())
-                    contributions.setdefault(role, []).append(trend_levels)
-
-                elif isinstance(comp, SeasonalityComponent):
-                    post_params = comp.extract_posterior(node_key, samples)
-
-                    # vmap over sample dimension
-                    seasonal = jax.vmap(
-                        lambda *p_vals: comp.forecast_contribute(
-                            dict(zip(post_params.keys(), p_vals)),
-                            T,
-                            horizon,
-                        ),
-                    )(*post_params.values())
-                    contributions.setdefault(role, []).append(seasonal)
-
-            # Regression
-            edges = data.predictor_edges.get(k, [])
-            if edges:
-                reg_comp = ExternalRegression()
-                reg_post = reg_comp.extract_posterior(node_key, samples)
-
-                # Build future X for this node
-                x_cols: list[jnp.ndarray] = []
-                for edge in edges:
-                    src = edge.source
-                    if not isinstance(src, ExternalNode):
-                        x_cols.append(jnp.zeros(horizon))
-                        continue
-                    lag = edge.lag
-                    x_hist = data.x[src]
-                    if src in x_fut:
-                        x_extended = jnp.concatenate([x_hist, x_fut[src]])
-                    else:
-                        x_extended = x_hist
-                    x_fc = x_extended[T - lag: T - lag + horizon]
-                    x_cols.append(x_fc)
-
-                X_future_node = jnp.stack(x_cols, axis=-1)  # (horizon, n_edges)
-                reg_forecast = jax.vmap(
-                    lambda *p_vals: reg_comp.forecast_contribute(
-                        dict(zip(reg_post.keys(), p_vals)),
-                        X_future_node,
-                    ),
-                )(*reg_post.values())
-                contributions.setdefault("regression", []).append(reg_forecast)
-
-            node_forecast = agg.aggregate(contributions, (num_samp, horizon))
-            forecast_per_node.append(node_forecast)
-
-        # --- Stack: (S, horizon, N) and add obs noise --------------------
-        forecast_stack = jnp.stack(forecast_per_node, axis=-1)  # (S, horizon, N)
-
-        obs_sigma_arr = jnp.stack(
-            [samples[f"obs_sigma_{k}"] for k in leaf_nodes], axis=-1,
-        )  # (S, N)
-
-        k3, rng_key = jr.split(rng_key)
-        obs_noise = jr.normal(k3, forecast_stack.shape) * obs_sigma_arr[:, None, :]
-        forecast_samples = forecast_stack + obs_noise
-
-        # --- Extract per-node and unstandardise ---------------------------
-        results: dict[ModelKey, np.ndarray] = {}
-        for i, k in enumerate(leaf_nodes):
-            raw = np.asarray(forecast_samples[:, :, i])
-            results[k] = data.unstandardize(k, raw)
-
-        # Root nodes = sum of leaves (on original scale)
-        if self.reconciliation in ("bottom_up", "soft") and data.root_nodes:
-            for root in data.root_nodes:
-                results[root] = sum(results[k] for k in data.children_map[root])
-
+        results, _ = self._forecast_core(horizon, x_future, rng_seed, decompose=False)
         return results
 
     def forecast_decomposed(
@@ -952,143 +1001,7 @@ class HierarchicalForecaster:
             :meth:`forecast` output and decomposition contains per-component
             contributions.
         """
-        if self._samples is None or self._data is None:
-            raise RuntimeError("Must call .fit() before .forecast_decomposed()")
-
-        data = self._data
-        leaf_nodes = data.leaf_nodes
-        T = data.T
-        samples = self._samples
-
-        num_samp = samples[f"obs_sigma_{leaf_nodes[0]}"].shape[0]
-        rng_key = jr.PRNGKey(rng_seed)
-
-        # Build future external predictors
-        x_fut: dict[ExternalNode, jnp.ndarray] = {}
-        if any(data.predictor_edges.get(k, []) for k in leaf_nodes):
-            for ext, x_hist in data.x.items():
-                if x_future and ext in x_future:
-                    x_fut[ext] = jnp.array(x_future[ext][:horizon], dtype=jnp.float32)
-                else:
-                    k1, rng_key = jr.split(rng_key)
-                    inn = jr.normal(k1, (horizon,))
-                    x_fut[ext] = x_hist[-1] + jnp.cumsum(0.1 * inn)
-
-        decomp_contribs: dict[ModelKey, dict[str, np.ndarray]] = {}
-        decomp_reg_coeffs: dict[ModelKey, dict[str, np.ndarray]] = {}
-        decomp_agg_type: dict[ModelKey, str] = {}
-        forecast_per_node: list[jnp.ndarray] = []
-
-        for i, k in enumerate(leaf_nodes):
-            cfg = self.node_configs.get(k, NodeConfig())
-            node_key = str(k)
-            components = resolve_components(cfg)
-            agg = resolve_aggregator(cfg)
-            decomp_agg_type[k] = agg.component_name
-            node_decomp: dict[str, np.ndarray] = {}
-
-            contributions: dict[str, list[jnp.ndarray]] = {}
-
-            for comp in components:
-                role = component_role(comp)
-                if isinstance(comp, TrendComponent):
-                    post_params = comp.extract_posterior(node_key, samples)
-                    final_state_key = f"final_state_{node_key}"
-                    final_state = samples[final_state_key]
-
-                    k1, rng_key = jr.split(rng_key)
-                    rng_keys = jr.split(k1, num_samp)
-
-                    trend_levels = jax.vmap(
-                        lambda fs, rk, *p_vals: comp.forecast_from_state(
-                            fs, dict(zip(post_params.keys(), p_vals)), horizon, rk,
-                        ),
-                    )(final_state, rng_keys, *post_params.values())
-                    contributions.setdefault(role, []).append(trend_levels)
-                    comp_label = f"trend_{comp.component_name}"
-                    node_decomp[comp_label] = np.asarray(trend_levels)
-
-                elif isinstance(comp, SeasonalityComponent):
-                    post_params = comp.extract_posterior(node_key, samples)
-                    seasonal = jax.vmap(
-                        lambda *p_vals: comp.forecast_contribute(
-                            dict(zip(post_params.keys(), p_vals)), T, horizon,
-                        ),
-                    )(*post_params.values())
-                    contributions.setdefault(role, []).append(seasonal)
-                    comp_label = f"seasonality_{comp.component_name}"
-                    node_decomp[comp_label] = np.asarray(seasonal)
-
-            # Regression
-            edges = data.predictor_edges.get(k, [])
-            if edges:
-                reg_comp = ExternalRegression()
-                reg_post = reg_comp.extract_posterior(node_key, samples)
-
-                x_cols: list[jnp.ndarray] = []
-                edge_names: list[str] = []
-                for edge in edges:
-                    src = edge.source
-                    if not isinstance(src, ExternalNode):
-                        x_cols.append(jnp.zeros(horizon))
-                        edge_names.append(str(src))
-                        continue
-                    edge_names.append(src.name)
-                    lag = edge.lag
-                    x_hist = data.x[src]
-                    if src in x_fut:
-                        x_extended = jnp.concatenate([x_hist, x_fut[src]])
-                    else:
-                        x_extended = x_hist
-                    x_fc = x_extended[T - lag: T - lag + horizon]
-                    x_cols.append(x_fc)
-
-                X_future_node = jnp.stack(x_cols, axis=-1)
-                reg_forecast = jax.vmap(
-                    lambda *p_vals: reg_comp.forecast_contribute(
-                        dict(zip(reg_post.keys(), p_vals)), X_future_node,
-                    ),
-                )(*reg_post.values())
-                contributions.setdefault("regression", []).append(reg_forecast)
-                node_decomp["regression_total"] = np.asarray(reg_forecast)
-
-                # Per-predictor attribution: betas[:, j] * X_future[:, j]
-                betas = np.asarray(reg_post["betas"])  # (S, n_edges)
-                reg_coeffs: dict[str, np.ndarray] = {}
-                for j, ename in enumerate(edge_names):
-                    # Per-predictor contribution: (S, H)
-                    attr = betas[:, j:j+1] * np.asarray(X_future_node[:, j])[None, :]
-                    node_decomp[f"regression_{ename}"] = attr
-                    reg_coeffs[ename] = betas[:, j]
-                decomp_reg_coeffs[k] = reg_coeffs
-
-            decomp_contribs[k] = node_decomp
-            node_forecast = agg.aggregate(contributions, (num_samp, horizon))
-            forecast_per_node.append(node_forecast)
-
-        # Stack and add obs noise
-        forecast_stack = jnp.stack(forecast_per_node, axis=-1)
-        obs_sigma_arr = jnp.stack(
-            [samples[f"obs_sigma_{k}"] for k in leaf_nodes], axis=-1,
-        )
-        k3, rng_key = jr.split(rng_key)
-        obs_noise = jr.normal(k3, forecast_stack.shape) * obs_sigma_arr[:, None, :]
-        forecast_samples = forecast_stack + obs_noise
-
-        results: dict[ModelKey, np.ndarray] = {}
-        for i, k in enumerate(leaf_nodes):
-            raw = np.asarray(forecast_samples[:, :, i])
-            results[k] = data.unstandardize(k, raw)
-
-        if self.reconciliation in ("bottom_up", "soft") and data.root_nodes:
-            for root in data.root_nodes:
-                results[root] = sum(results[k] for k in data.children_map[root])
-
-        decomposition = Decomposition(
-            contributions=decomp_contribs,
-            regression_coefficients=decomp_reg_coeffs,
-            aggregator_type=decomp_agg_type,
-        )
+        results, decomposition = self._forecast_core(horizon, x_future, rng_seed, decompose=True)
         return results, decomposition
 
     def summary(self) -> None:

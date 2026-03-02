@@ -149,6 +149,34 @@ class MyTrend(TrendComponent, name="my_trend"):
         self.scale = scale  # stored as attribute → auto-serialized
 ```
 
+## Implementing `batched_scan` (optional)
+
+For large hierarchies, the forecaster batches nodes of the same trend type
+through `jax.vmap`.  Built-in components implement `prepare_batch_data`,
+`_make_scan_step_fn`, and `batched_scan` for this.
+
+If you **don't** override these methods, the forecaster falls back to a
+sequential per-node `jax.lax.scan`.  This is perfectly correct — just
+slower for hierarchies with many nodes sharing the same custom trend.
+
+Here's how to add batched scan support to `FlatTrend`:
+
+```python
+class FlatTrend(TrendComponent, name="flat_trend"):
+    ...
+
+    def prepare_batch_data(self, group):
+        inits = jnp.stack([g[4] for g in group])
+        innovations = jnp.stack([g[3]["dummy"][:, None] for g in group])
+        scalar_params = {}  # No scalar params for flat trend
+        return inits, innovations, scalar_params
+
+    def _make_scan_step_fn(self, params):
+        def step(carry, inn_t):
+            return carry, carry[0]
+        return step
+```
+
 ## Tips
 
 - Keep `sample_params` names unique per component by prefixing with the

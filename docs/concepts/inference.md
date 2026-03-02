@@ -86,6 +86,23 @@ For example, if 50 leaf nodes all use `LocalLinearTrend`, their state-space
 scans are stacked into tensors of shape `(50, T, 2)` and executed as one
 vectorised operation.
 
+Batching is now **owned by the component**, not the forecaster.  Each
+built-in `TrendComponent` subclass implements `prepare_batch_data`,
+`_make_scan_step_fn`, and `batched_scan`.  Custom trend components
+get an automatic fallback sequential scan.
+
+## Reconciliation strategies
+
+Reconciliation controls how leaf-node forecasts produce root-node
+forecasts.  The forecaster uses a **strategy pattern** with three
+options:
+
+| Strategy | Description |
+|----------|-------------|
+| `"bottom_up"` | Root = deterministic sum of leaf forecasts (default) |
+| `"soft"` | Same as bottom-up for now (placeholder for future Gaussian potential) |
+| `"none"` | No root forecasts produced |
+
 ## Forecasting
 
 After fitting, [`forecast`][ergodicts.forecaster.HierarchicalForecaster.forecast]

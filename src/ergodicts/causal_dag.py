@@ -366,7 +366,7 @@ class NodeConfig(BaseModel):
     from its hierarchy parent (``"passive"``), or lets the model
     decide (``"auto"``).
 
-    Parameters
+    Attributes
     ----------
     mode : str
         ``"auto"`` estimates mixing weight from data, ``"active"``

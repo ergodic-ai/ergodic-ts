@@ -71,16 +71,41 @@ class ForecastData:
 
 @dataclass
 class Decomposition:
-    """Per-component contributions alongside forecasts.
+    """Per-component forecast contributions for interpretability.
+
+    Captures each component's individual contribution to the forecast,
+    allowing you to see how much of the predicted value comes from
+    trend, seasonality, regression, etc.
 
     Attributes
     ----------
-    contributions
-        ``{node_key: {"trend": (S, H), "seasonality_fourier": (S, H), ...}}``
-    regression_coefficients
-        ``{node_key: {"predictor_name": (S,)}}`` — full posterior over betas.
-    aggregator_type
-        ``{node_key: "additive"}`` — tells UI how components combine.
+    contributions : dict[ModelKey, dict[str, ndarray]]
+        Per-node, per-component contribution arrays.
+        Shape ``(num_samples, horizon)`` for each entry.
+        Keys follow the pattern ``"trend_local_linear_trend"``,
+        ``"seasonality_fourier_seasonality"``, ``"regression_total"``,
+        ``"regression_<predictor_name>"``.
+    regression_coefficients : dict[ModelKey, dict[str, ndarray]]
+        Per-node regression coefficients.
+        ``{node_key: {"predictor_name": (num_samples,)}}`` —
+        full posterior over beta coefficients.
+    aggregator_type : dict[ModelKey, str]
+        Per-node aggregator name (e.g. ``"additive"``,
+        ``"multiplicative_seasonality"``).  Tells downstream consumers
+        how the components should be recombined.
+
+    Examples
+    --------
+    ```python
+    forecasts, decomp = model.forecast_decomposed(horizon=12)
+
+    # Trend contribution for a specific node
+    trend = decomp.contributions[key]["trend_local_linear_trend"]  # (500, 12)
+    trend_median = np.median(trend, axis=0)
+
+    # Regression coefficient posterior
+    beta_gdp = decomp.regression_coefficients[key]["GDP"]  # (500,)
+    ```
     """
 
     contributions: dict[ModelKey, dict[str, np.ndarray]]
@@ -668,7 +693,10 @@ class HierarchicalForecaster:
         svi_progress_bar
             Show progress bar for SVI training.
 
-        Returns *self* for method chaining.
+        Returns
+        -------
+        HierarchicalForecaster
+            *self*, for method chaining.
         """
         x_data = x_data or {}
         self._data = prepare_data(
@@ -906,6 +934,23 @@ class HierarchicalForecaster:
 
         Returns the same forecasts as :meth:`forecast` plus a
         :class:`Decomposition` capturing each component's contribution.
+
+        Parameters
+        ----------
+        horizon : int
+            Number of future time steps to forecast.
+        x_future : dict or None
+            Future external predictor values, shape ``(horizon,)`` each.
+            If omitted, external series are extended via random walk.
+        rng_seed : int
+            JAX PRNG seed.
+
+        Returns
+        -------
+        tuple[dict[ModelKey, ndarray], Decomposition]
+            ``(forecasts, decomposition)`` where forecasts is identical to
+            :meth:`forecast` output and decomposition contains per-component
+            contributions.
         """
         if self._samples is None or self._data is None:
             raise RuntimeError("Must call .fit() before .forecast_decomposed()")

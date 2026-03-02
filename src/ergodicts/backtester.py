@@ -312,18 +312,34 @@ def _deserialize_node_configs(data: dict[str, Any], key_lookup: dict[str, ModelK
 class BacktestResult:
     """Results from a single backtest fold.
 
+    Each fold represents one train/test split: the model is fit on
+    ``y[:cutoff]`` and evaluated on ``y[cutoff:cutoff+horizon]``.
+
     Attributes
     ----------
-    cutoff
+    cutoff : int
         Index of the last training observation.
-    horizon
+    horizon : int
         Number of forecast steps.
-    metrics
-        Per-node metric dictionaries.
-    forecasts
-        Per-node posterior predictive samples ``(num_samples, horizon)``.
-    actuals
-        Per-node ground truth ``(horizon,)``.
+    metrics : dict[ModelKey, dict[str, float]]
+        Per-node metric dictionaries (MAE, RMSE, MAPE, etc.).
+    forecasts : dict[ModelKey, ndarray]
+        Per-node posterior predictive samples, shape ``(num_samples, horizon)``.
+    actuals : dict[ModelKey, ndarray]
+        Per-node ground truth, shape ``(horizon,)``.
+
+    Examples
+    --------
+    ```python
+    fold = result.folds[0]
+    fold.cutoff       # 48  (trained on first 48 observations)
+    fold.horizon      # 12
+    fold.metrics[key] # {'mae': 1.23, 'rmse': 1.56, ...}
+
+    # Posterior predictive samples
+    samples = fold.forecasts[key]   # shape (500, 12)
+    median = np.median(samples, axis=0)
+    ```
     """
 
     cutoff: int
@@ -351,15 +367,37 @@ class BacktestResult:
 class BacktestSummary:
     """Aggregated results across all backtest folds.
 
+    Provides fold-level detail and a summary DataFrame averaging metrics
+    across folds.  Supports persistence via :meth:`save` / :meth:`load`
+    and plotting via :meth:`plot`.
+
     Attributes
     ----------
-    folds
-        Individual :class:`BacktestResult` objects.
-    summary_df
-        DataFrame with mean metrics across folds, indexed by node.
-    run_config
+    folds : list[BacktestResult]
+        Individual :class:`BacktestResult` objects, one per fold.
+    summary_df : DataFrame
+        Mean metrics across folds, indexed by node string.
+    run_config : dict
         Configuration dict capturing all parameters needed to reproduce
         this run.  Populated automatically by :meth:`Backtester.run`.
+    time_index : list[str] or None
+        Full time index as ISO strings (if provided to the backtest run).
+
+    Examples
+    --------
+    ```python
+    result = bt.run(y_data, x_data, mode="expanding", test_size=12, n_splits=3)
+
+    # Summary table
+    print(result.summary_df)
+
+    # Save and reload
+    result.save("runs/my_run")
+    loaded = BacktestSummary.load("runs/my_run")
+
+    # Plot
+    fig = result.plot(y_data, dates=date_index)
+    ```
     """
 
     folds: list[BacktestResult]

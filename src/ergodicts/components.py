@@ -99,7 +99,25 @@ class Aggregator(ABC):
 
 
 class AdditiveAggregator(Aggregator, name="additive"):
-    """``mu = sum(all contributions across all roles)`` (default)."""
+    """Sum all component contributions across all roles (default).
+
+    .. math::
+
+        \\mu_t = \\sum_{c \\in \\text{components}} f_c(t)
+
+    This is the simplest aggregation strategy and the default when no
+    aggregator is specified in :class:`~ergodicts.causal_dag.NodeConfig`.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import AdditiveAggregator
+
+    agg = AdditiveAggregator()
+    result = agg.aggregate({"trend": [trend_arr], "seasonality": [seas_arr]}, shape=(T,))
+    # result = trend_arr + seas_arr
+    ```
+    """
 
     def aggregate(
         self,
@@ -114,9 +132,24 @@ class AdditiveAggregator(Aggregator, name="additive"):
 
 
 class MultiplicativeAggregator(Aggregator, name="multiplicative"):
-    """``mu = product(all contributions across all roles)``.
+    """Multiply all component contributions across all roles.
 
-    Components should output *factors* centered around 1.
+    .. math::
+
+        \\mu_t = \\prod_{c \\in \\text{components}} f_c(t)
+
+    Components should output *factors* centred around 1 so that the
+    product remains in a sensible range.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import MultiplicativeAggregator
+
+    agg = MultiplicativeAggregator()
+    result = agg.aggregate({"trend": [trend_arr], "seasonality": [seas_arr]}, shape=(T,))
+    # result = trend_arr * seas_arr
+    ```
     """
 
     def aggregate(
@@ -132,10 +165,25 @@ class MultiplicativeAggregator(Aggregator, name="multiplicative"):
 
 
 class LogAdditiveAggregator(Aggregator, name="log_additive"):
-    """``mu = exp(sum(all contributions across all roles))``.
+    """Sum contributions in log-space and exponentiate.
 
-    Components contribute in log-space; the result is exponentiated
-    to ensure positivity.  Natural for revenue or count data.
+    .. math::
+
+        \\mu_t = \\exp\\!\\left(\\sum_{c \\in \\text{components}} f_c(t)\\right)
+
+    Components contribute in log-space; the result is exponentiated to
+    ensure strict positivity.  Natural for revenue or count data where
+    negative predictions are not meaningful.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import LogAdditiveAggregator
+
+    agg = LogAdditiveAggregator()
+    result = agg.aggregate({"trend": [log_trend], "seasonality": [log_seas]}, shape=(T,))
+    # result = exp(log_trend + log_seas)
+    ```
     """
 
     def aggregate(
@@ -151,12 +199,34 @@ class LogAdditiveAggregator(Aggregator, name="log_additive"):
 
 
 class MultiplicativeSeasonality(Aggregator, name="multiplicative_seasonality"):
-    """``mu = (sum(trend) + sum(regression)) * product(1 + seasonality)``.
+    """Additive base modulated by multiplicative seasonal factors.
+
+    .. math::
+
+        \\mu_t = \\underbrace{\\bigl(\\sum \\text{trend}_t + \\sum \\text{regression}_t\\bigr)}_{\\text{base}}
+                \\;\\times\\;
+                \\underbrace{\\prod_i (1 + s_{i,t})}_{\\text{seasonal factors}}
 
     Trend and regression contributions are additive among themselves.
-    Seasonality components are interpreted as additive effects that
-    become multiplicative factors via ``1 + s``.  Unknown roles
-    default to additive inclusion (forward-compatible).
+    Seasonality components output additive effects that become
+    multiplicative factors via :math:`1 + s`.  Unknown roles default to
+    additive inclusion (forward-compatible).
+
+    This is the recommended aggregator when using
+    :class:`MultiplicativeFourierSeasonality` or
+    :class:`MultiplicativeMonthlySeasonality`.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import MultiplicativeSeasonality, MultiplicativeFourierSeasonality, LocalLinearTrend
+    from ergodicts import NodeConfig
+
+    cfg = NodeConfig(
+        components=(LocalLinearTrend(), MultiplicativeFourierSeasonality(n_harmonics=2)),
+        aggregator=MultiplicativeSeasonality(),
+    )
+    ```
     """
 
     def aggregate(
@@ -435,7 +505,36 @@ class RegressionComponent(ABC):
 
 
 class LocalLinearTrend(TrendComponent, name="local_linear_trend"):
-    """Standard local linear trend: level + slope with Gaussian innovations."""
+    """Local linear trend with Gaussian random-walk level and slope.
+
+    State-space equations:
+
+    .. math::
+
+        \\ell_t &= \\ell_{t-1} + b_{t-1} + \\sigma_\\ell\\,\\varepsilon^\\ell_t \\\\
+        b_t     &= b_{t-1} + \\sigma_b\\,\\varepsilon^b_t
+
+    where :math:`\\varepsilon^\\ell_t, \\varepsilon^b_t \\sim \\mathcal{N}(0,1)`.
+    The observed contribution is :math:`\\ell_t`.
+
+    Priors
+    ------
+    - ``level_sigma`` ~ HalfNormal(0.5) — level innovation scale
+    - ``slope_sigma`` ~ HalfNormal(0.05) — slope innovation scale
+    - ``level_init``  ~ Normal(0, 1) — initial level
+    - ``slope_init``  ~ Normal(0, 0.1) — initial slope
+
+    State dimension: 2 ``[level, slope]``.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import LocalLinearTrend
+    from ergodicts import NodeConfig
+
+    cfg = NodeConfig(components=(LocalLinearTrend(),))
+    ```
+    """
 
     def sample_params(self, node_key: str) -> dict[str, Any]:
         level_sigma = numpyro.sample(f"llt_level_sigma_{node_key}", dist.HalfNormal(0.5))
@@ -517,7 +616,39 @@ class LocalLinearTrend(TrendComponent, name="local_linear_trend"):
 
 
 class DampedLocalLinearTrend(TrendComponent, name="damped_local_linear_trend"):
-    """Local linear trend with damped slope (phi < 1)."""
+    """Local linear trend with exponentially damped slope.
+
+    State-space equations:
+
+    .. math::
+
+        \\ell_t &= \\ell_{t-1} + b_{t-1} + \\sigma_\\ell\\,\\varepsilon^\\ell_t \\\\
+        b_t     &= \\varphi\\, b_{t-1} + \\sigma_b\\,\\varepsilon^b_t
+
+    where :math:`\\varphi \\in (0,1)` damps the slope towards zero over time.
+    When :math:`\\varphi = 1` this reduces to :class:`LocalLinearTrend`.
+    The half-life of the slope is :math:`\\ln 2 / (-\\ln \\varphi)` steps.
+
+    Priors
+    ------
+    - ``level_sigma`` ~ HalfNormal(0.5)
+    - ``slope_sigma`` ~ HalfNormal(0.05)
+    - ``level_init``  ~ Normal(0, 1)
+    - ``slope_init``  ~ Normal(0, 0.1)
+    - ``phi``         ~ Beta(8, 2) — prior centres around 0.8 (moderate damping)
+
+    State dimension: 2 ``[level, slope]``.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import DampedLocalLinearTrend
+    from ergodicts import NodeConfig
+
+    # Good default for series with trending behaviour that should flatten
+    cfg = NodeConfig(components=(DampedLocalLinearTrend(),))
+    ```
+    """
 
     def sample_params(self, node_key: str) -> dict[str, Any]:
         level_sigma = numpyro.sample(f"dllt_level_sigma_{node_key}", dist.HalfNormal(0.5))
@@ -607,11 +738,35 @@ class DampedLocalLinearTrend(TrendComponent, name="damped_local_linear_trend"):
 
 
 class OUMeanReversion(TrendComponent, name="ou_mean_reversion"):
-    """Ornstein-Uhlenbeck mean-reverting process.
+    """Ornstein--Uhlenbeck mean-reverting trend process.
 
-    ``level_{t+1} = level_t + theta * (mu - level_t) + sigma * eps``
+    State-space equation:
 
-    State: ``[level]`` (1-dimensional).
+    .. math::
+
+        \\ell_t = \\ell_{t-1} + \\theta\\,(\\mu - \\ell_{t-1}) + \\sigma\\,\\varepsilon_t
+
+    The process reverts to long-run level :math:`\\mu` at speed
+    :math:`\\theta`.  Half-life is :math:`\\ln 2 / \\theta` steps.
+
+    Priors
+    ------
+    - ``theta``      ~ HalfNormal(0.5) — mean-reversion speed
+    - ``mu``         ~ Normal(0, 1) — long-run level
+    - ``sigma``      ~ HalfNormal(0.5) — shock scale
+    - ``level_init`` ~ Normal(0, 1)
+
+    State dimension: 1 ``[level]``.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import OUMeanReversion
+    from ergodicts import NodeConfig
+
+    # For series that oscillate around a stable mean
+    cfg = NodeConfig(components=(OUMeanReversion(),))
+    ```
     """
 
     @property
@@ -696,7 +851,39 @@ class OUMeanReversion(TrendComponent, name="ou_mean_reversion"):
 
 
 class FourierSeasonality(SeasonalityComponent, name="fourier_seasonality"):
-    """Fourier harmonic seasonality with configurable period and harmonics."""
+    """Additive Fourier harmonic seasonality.
+
+    Models the seasonal pattern as a sum of sine and cosine basis functions:
+
+    .. math::
+
+        s_t = \\sum_{h=1}^{H} \\bigl(a_h \\sin(2\\pi h\\, t / P) + b_h \\cos(2\\pi h\\, t / P)\\bigr)
+
+    where :math:`P` is the period (e.g. 12 for monthly data), :math:`H` is
+    the number of harmonics, and :math:`a_h, b_h \\sim \\mathcal{N}(0, 0.5)`.
+
+    Higher harmonics capture sharper seasonal features but risk overfitting.
+    For monthly data, ``n_harmonics=2`` captures the dominant annual pattern;
+    use ``n_harmonics=6`` to fit every month independently.
+
+    Parameters
+    ----------
+    n_harmonics : int
+        Number of Fourier harmonic pairs (sin + cos).  Total coefficients
+        = ``2 * n_harmonics``.
+    period : float
+        Length of one seasonal cycle.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import FourierSeasonality, LocalLinearTrend
+    from ergodicts import NodeConfig
+
+    # Annual seasonality on monthly data
+    cfg = NodeConfig(components=(LocalLinearTrend(), FourierSeasonality(n_harmonics=2, period=12.0)))
+    ```
+    """
 
     def __init__(self, n_harmonics: int = 2, period: float = 12.0) -> None:
         self.n_harmonics = n_harmonics
@@ -825,7 +1012,30 @@ class MultiplicativeFourierSeasonality(SeasonalityComponent, name="multiplicativ
 
 
 class MonthlySeasonality(SeasonalityComponent, name="monthly_seasonality"):
-    """12 month-level dummy effects with soft sum-to-zero constraint."""
+    """Per-month dummy seasonality with soft sum-to-zero constraint.
+
+    Samples 12 free effects :math:`r_1, \\dots, r_{12} \\sim \\mathcal{N}(0, 1)`
+    and centres them:
+
+    .. math::
+
+        s_m = r_m - \\bar{r}, \\qquad m = 1, \\dots, 12
+
+    so that :math:`\\sum_m s_m = 0`.  Each time step is mapped to its
+    month via ``t % 12``.
+
+    This is more flexible than :class:`FourierSeasonality` (can represent
+    any monthly pattern) but uses more parameters (12 vs ``2H``).
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import MonthlySeasonality, LocalLinearTrend
+    from ergodicts import NodeConfig
+
+    cfg = NodeConfig(components=(LocalLinearTrend(), MonthlySeasonality()))
+    ```
+    """
 
     def sample_params(self, node_key: str) -> dict[str, Any]:
         raw = numpyro.sample(
@@ -922,7 +1132,26 @@ class MultiplicativeMonthlySeasonality(SeasonalityComponent, name="multiplicativ
 
 
 class ExternalRegression(RegressionComponent, name="external_regression"):
-    """Linear regression on external predictors."""
+    """Linear regression on external predictor series.
+
+    Models the regression contribution as:
+
+    .. math::
+
+        r_t = \\sum_{j=1}^{J} \\beta_j\\, x_{j,t}
+
+    where :math:`x_{j,t}` are the (standardised) external predictor values
+    and :math:`\\beta_j \\sim \\mathcal{N}(0, 1)`.
+
+    External predictors are linked to nodes via :class:`~ergodicts.causal_dag.CausalDAG`
+    edges.  The lag and contemporaneous settings on each
+    :class:`~ergodicts.causal_dag.EdgeSpec` control how predictor values
+    are time-shifted before entering the regression.
+
+    This component is automatically included for any leaf node that has
+    incoming edges in the CausalDAG; you do not need to add it to
+    ``NodeConfig.components`` explicitly.
+    """
 
     def sample_params(self, node_key: str, n_predictors: int) -> dict[str, Any]:
         betas = numpyro.sample(
@@ -1031,6 +1260,19 @@ class ComponentLibrary:
     Use :meth:`all_components` to browse the full library, or
     :meth:`from_dict` to deserialize any component/aggregator from a
     dict produced by ``to_dict()``.
+
+    Examples
+    --------
+    ```python
+    from ergodicts.components import ComponentLibrary
+
+    # Browse all available components
+    for name, info in ComponentLibrary.all_components().items():
+        print(f"{name} ({info['role']}): {info['description']}")
+
+    # Deserialize a component from a dict (e.g. loaded from JSON)
+    comp = ComponentLibrary.from_dict({"type": "local_linear_trend", "params": {}})
+    ```
     """
 
     _BASE_CLASSES: ClassVar[dict[str, type]] = {

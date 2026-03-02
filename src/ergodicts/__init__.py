@@ -45,6 +45,15 @@ from ergodicts.components import (
 )
 from ergodicts.forecaster import HierarchicalForecaster, ForecastData
 from ergodicts.backtester import Backtester, BacktestResult, BacktestSummary
+from ergodicts.harmonizer import (
+    ForecastBelief,
+    Constraint,
+    AdditiveConstraint,
+    PriceConstraint,
+    ElasticityConstraint,
+    Harmonizer,
+    HarmonizedResult,
+)
 
 
 def snowflake_client(**kwargs) -> SnowflakeClient:

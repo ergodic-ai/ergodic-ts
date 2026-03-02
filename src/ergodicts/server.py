@@ -23,30 +23,54 @@ from ergodicts.backtester import BacktestSummary, _node_key_from_str, _node_key_
 
 
 class RunListItem(BaseModel):
+    """Summary of a single backtest run for list display."""
+
     id: str
+    """Unique run identifier (directory name)."""
     run_name: str
+    """Human-readable name given at launch time."""
     timestamp: str
+    """ISO timestamp when the run completed."""
     n_folds: int
+    """Number of backtest folds."""
     elapsed_seconds: float
+    """Wall-clock time for the run."""
     n_series: int
+    """Number of internal time-series in the hierarchy."""
 
 
 class LaunchRequest(BaseModel):
+    """Request body for launching a new backtest run via the dashboard."""
+
     run_name: str = "unnamed"
+    """Human-readable name for this run."""
     data_path: str
+    """Path to an NPZ file containing ``y__<key>`` arrays and a ``config_run_path``."""
     mode: str = "single"
+    """Backtest mode: ``"single"`` or ``"expanding"``."""
     test_size: int = 12
+    """Number of time steps in each test window (forecast horizon)."""
     n_splits: int = 1
+    """Number of expanding-window folds (ignored for ``mode="single"``)."""
     num_warmup: int = 200
+    """NUTS warmup iterations per fold."""
     num_samples: int = 500
+    """Posterior samples per fold."""
     num_chains: int = 1
+    """MCMC chains per fold."""
     rng_seed: int = 0
+    """Base PRNG seed."""
     reconciliation: str = "bottom_up"
+    """Hierarchy reconciliation strategy."""
 
 
 class LaunchResponse(BaseModel):
+    """Response after successfully launching a backtest run."""
+
     run_id: str
+    """Unique identifier for the launched run."""
     status: str
+    """Initial status, always ``"running"``."""
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +87,35 @@ _run_status: dict[str, str] = {}  # run_id -> "running" | "completed" | "failed"
 
 
 def create_app(runs_dir: Path) -> FastAPI:
-    """Create the FastAPI app bound to *runs_dir*."""
+    """Create the FastAPI backtest dashboard application.
+
+    Parameters
+    ----------
+    runs_dir : Path
+        Directory where backtest runs are saved (each run is a
+        subdirectory with ``meta.json``, ``summary.csv``, and
+        ``folds/`` arrays).  Created if it doesn't exist.
+
+    Returns
+    -------
+    FastAPI
+        Configured application with API endpoints for listing, viewing,
+        comparing, and launching backtest runs, plus a static frontend.
+
+    Endpoints
+    ---------
+    - ``GET /api/runs`` — list all saved and in-progress runs
+    - ``GET /api/runs/{run_id}`` — metadata for a single run
+    - ``GET /api/runs/{run_id}/summary`` — per-node metrics table
+    - ``GET /api/runs/{run_id}/charts`` — Plotly JSON figures per node
+    - ``GET /api/runs/{run_id}/fold/{fold_idx}`` — detailed fold data
+    - ``GET /api/runs/{run_id}/fold/{fold_idx}/param-cards`` — parameter cards
+    - ``GET /api/runs/{run_id}/fold/{fold_idx}/decomposition`` — component decomposition
+    - ``GET /api/compare?run_a=...&run_b=...`` — side-by-side run comparison
+    - ``POST /api/runs`` — launch a new backtest run
+    - ``GET /api/runs/{run_id}/progress`` — SSE stream of run progress
+    - ``GET /api/components`` — component library catalogue
+    """
 
     app = FastAPI(title="Ergodicts Backtest Dashboard")
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +157,7 @@ def create_app(runs_dir: Path) -> FastAPI:
 
     @app.get("/api/runs")
     async def list_runs() -> list[dict[str, Any]]:
+        """List all saved and in-progress backtest runs, newest first."""
         runs = _scan_runs()
         # Append any in-progress runs that don't have meta.json yet
         for run_id, status in _run_status.items():
@@ -122,6 +175,7 @@ def create_app(runs_dir: Path) -> FastAPI:
 
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str) -> dict[str, Any]:
+        """Return full metadata for a single run (or status if still running)."""
         # Check if it's an active run
         if run_id in _run_status and _run_status[run_id] == "running":
             return {"id": run_id, "status": "running"}
@@ -133,6 +187,7 @@ def create_app(runs_dir: Path) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/summary")
     async def get_summary(run_id: str) -> list[dict[str, Any]]:
+        """Return per-node mean metrics as a list of row dicts."""
         run_path = _get_run_dir(run_id)
         import pandas as pd
 
@@ -283,6 +338,7 @@ def create_app(runs_dir: Path) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/fold/{fold_idx}")
     async def get_fold(run_id: str, fold_idx: int) -> dict[str, Any]:
+        """Return detailed data for a single backtest fold (forecasts, actuals, metrics)."""
         run_path = _get_run_dir(run_id)
         meta = json.loads((run_path / "meta.json").read_text())
 
@@ -514,6 +570,11 @@ def create_app(runs_dir: Path) -> FastAPI:
 
     @app.post("/api/runs")
     async def launch_run(req: LaunchRequest) -> LaunchResponse:
+        """Launch a new backtest run in a background thread.
+
+        The run executes asynchronously; use the ``/api/runs/{run_id}/progress``
+        SSE endpoint to monitor progress.
+        """
         from ergodicts.backtester import Backtester, _node_key_from_str
 
         data_path = Path(req.data_path)
@@ -600,6 +661,11 @@ def create_app(runs_dir: Path) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/progress")
     async def stream_progress(run_id: str):
+        """Server-Sent Events stream for monitoring a running backtest.
+
+        Emits ``fold_start``, ``fold_done``, ``heartbeat``, ``complete``,
+        and ``error`` events as JSON payloads.
+        """
         if run_id not in _active_runs:
             # Already completed — send a single "complete" event
             if (runs_dir / run_id / "meta.json").exists():

@@ -1,5 +1,5 @@
 site_name: Ergodic TS
-site_description: Tools for time-series forecasting
+site_description: Hierarchical Bayesian time-series forecasting
 repo_url: https://github.com/ergodic/ergodicts
 
 theme:
@@ -21,7 +21,9 @@ theme:
     - content.code.copy
     - navigation.sections
     - navigation.expand
+    - navigation.indexes
     - search.suggest
+    - toc.follow
 
 plugins:
   - search
@@ -47,15 +49,35 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.snippets:
       base_path: ["."]
+  - pymdownx.arithmatex:
+      generic: true
   - toc:
       permalink: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Concepts:
+      - Hierarchical Forecasting: concepts/hierarchy.md
+      - Structural Components: concepts/components.md
+      - Causal DAG: concepts/causal-dag.md
+      - Bayesian Inference: concepts/inference.md
+  - Tutorials:
+      - End-to-End Pipeline: tutorials/end-to-end.md
+      - Backtesting: tutorials/backtesting.md
+      - Custom Components: tutorials/custom-components.md
   - API Reference:
-      - Snowflake Client: api/snowflake_client.md
+      - Forecaster: api/forecaster.md
+      - Components: api/components.md
+      - Causal DAG: api/causal_dag.md
+      - Backtester: api/backtester.md
+      - Dashboard Server: api/server.md
       - Reducer: api/reducer.md
+      - Snowflake Client: api/snowflake_client.md
       - Utils: api/utils.md
   - Examples:
       - Query Snowflake: examples/query_snowflake.md

@@ -32,6 +32,12 @@ Raw Data  →  Reducer  →  Hierarchy + CausalDAG  →  Forecaster  →  Foreca
                        (components,
                         aggregator)
 
+Forecasts  →  Harmonizer  →  Reconciled Forecasts
+                                    ↑
+                             Constraints
+                          (hierarchy, price,
+                            elasticity)
+
 Forecasts  →  Backtester  →  BacktestSummary  →  Dashboard Server
 ```
 
@@ -44,6 +50,7 @@ Forecasts  →  Backtester  →  BacktestSummary  →  Dashboard Server
 | [Causal DAG](api/causal_dag.md) | Directed graph of predictive relationships |
 | [Backtester](api/backtester.md) | Time-series cross-validation with 13 metrics |
 | [Dashboard Server](api/server.md) | FastAPI backend + interactive frontend |
+| [Harmonizer](api/harmonizer.md) | Post-hoc forecast reconciliation with price and elasticity constraints |
 | [Reducer](api/reducer.md) | Hierarchical aggregation across dimension combinations |
 | [Snowflake Client](api/snowflake_client.md) | Query Snowflake, write DataFrames to tables |
 | [Utils](api/utils.md) | Fiscal calendar helpers |

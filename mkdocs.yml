@@ -66,6 +66,7 @@ nav:
       - Structural Components: concepts/components.md
       - Causal DAG: concepts/causal-dag.md
       - Bayesian Inference: concepts/inference.md
+      - Forecast Harmonization: concepts/harmonization.md
   - Tutorials:
       - End-to-End Pipeline: tutorials/end-to-end.md
       - Backtesting: tutorials/backtesting.md
@@ -75,6 +76,7 @@ nav:
       - Components: api/components.md
       - Causal DAG: api/causal_dag.md
       - Backtester: api/backtester.md
+      - Harmonizer: api/harmonizer.md
       - Dashboard Server: api/server.md
       - Reducer: api/reducer.md
       - Snowflake Client: api/snowflake_client.md
